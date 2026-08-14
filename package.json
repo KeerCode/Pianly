@@ -1,0 +1,41 @@
+{
+  "name": "pianly",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "oxlint",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:mic": "tauri build --debug && codesign --force --sign - --entitlements src-tauri/Entitlements.plist src-tauri/target/debug/bundle/macos/Pianly.app && open src-tauri/target/debug/bundle/macos/Pianly.app"
+  },
+  "dependencies": {
+    "@coderline/alphatab": "^1.8.3",
+    "@coderline/alphatab-vite": "^1.8.3",
+    "@spotify/basic-pitch": "^1.0.1",
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-dialog": "^2.7.1",
+    "@tauri-apps/plugin-fs": "^2.5.1",
+    "dompurify": "^3.4.12",
+    "fflate": "^0.8.2",
+    "midi-file": "^1.2.4",
+    "opensheetmusicdisplay": "^2.0.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "smplr": "^1.0.0",
+    "tone": "^15.1.22",
+    "verovio": "^6.2.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.1",
+    "@tauri-apps/cli": "^2.11.3",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.2",
+    "oxlint": "^1.69.0",
+    "tailwindcss": "^4.3.1",
+    "vite": "^8.1.0"
+  }
+}

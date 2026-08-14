@@ -1,0 +1,39 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to upload to (e.g. v1.2)'
+        required: true
+        default: 'v1.2'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        run: npm run tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ''
+
+      - name: Upload MSI to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $msi = Get-ChildItem -Recurse -Filter "*.msi" src-tauri/target/release/bundle | Select-Object -First 1
+          $exe = Get-ChildItem -Recurse -Filter "*setup*.exe" src-tauri/target/release/bundle | Select-Object -First 1
+          gh release upload ${{ github.event.inputs.release_tag }} $msi.FullName $exe.FullName --repo KeerCode/Pianly-1.0.0 --clobber

@@ -1,0 +1,19 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "enables the default permissions",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "fs:allow-read-dir",
+    "fs:allow-read-file",
+    "fs:allow-write-text-file",
+    "dialog:allow-open",
+    {
+      "identifier": "fs:scope",
+      "allow": ["$DOCUMENT/**", "$DESKTOP/**", "$DOWNLOAD/**", "$MUSIC/**"]
+    }
+  ]
+}
