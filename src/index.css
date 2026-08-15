@@ -1,0 +1,67 @@
+@import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&display=swap');
+
+:root {
+  --bg:     oklch(0.12 0.025 270);
+  --panel:  oklch(0.16 0.02 270);
+  --ink:    oklch(0.95 0.008 270);
+  --sub:    oklch(0.62 0.015 270);
+  --accent: oklch(0.7 0.2 160);
+  --border: rgba(0,255,200,.12);
+}
+
+body { font-family: 'Sora', sans-serif; }
+
+/* Verovio current note highlight */
+.current-note * {
+  fill: oklch(0.55 0.18 160) !important;
+}
+
+/* Subtle float for ambient glows */
+@keyframes nebula-drift {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33%       { transform: translate(12px, -8px) scale(1.03); }
+  66%       { transform: translate(-8px, 10px) scale(0.97); }
+}
+.nebula { animation: nebula-drift ease-in-out infinite; }
+
+/* Glass panel base */
+.glass {
+  background: rgba(255,255,255,0.025);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+/* Converter page animations */
+@keyframes cv-pulse {
+  0%,100% { box-shadow: 0 0 0 0 rgba(0,255,200,0), 0 12px 48px rgba(0,0,0,0.45); }
+  50%      { box-shadow: 0 0 0 8px rgba(0,255,200,0.06), 0 12px 48px rgba(0,0,0,0.45); }
+}
+@keyframes cv-item-in {
+  from { opacity:0; transform:translateY(10px); }
+  to   { opacity:1; transform:translateY(0); }
+}
+@keyframes cv-spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes slideInRight {
+  from { opacity: 0; transform: translateX(20px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+/* Button press spring */
+button, a[href] {
+  transition: transform 0.22s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+button:hover:not(:disabled), a[href]:hover {
+  transform: scale(1.04);
+}
+button:active:not(:disabled), a[href]:active {
+  transform: scale(0.95);
+  transition-duration: 0.10s;
+}
