@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            label: macOS-arm64
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+            label: macOS-x64
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: Windows-x64
+
+    runs-on: ${{ matrix.platform }}
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add ${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Pianly ${{ github.ref_name }}'
+          releaseBody: |
+            Download the installer for your platform below.
+
+            **macOS:** Download the `.dmg` file, open it, and drag Pianly to Applications.
+            **Windows:** Download the `.msi` installer and run it.
+
+            > Note: On macOS, you may need to right-click and select "Open" the first time since the app is not notarized.
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.target }}
