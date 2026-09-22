@@ -103,6 +103,13 @@ function App() {
   const [folderLoading, setFolderLoading] = useState(false)
   const [showHint, setShowHint] = useState(false)
   const [bpm, setBpm] = useState(null)
+  const [scoreBpm, setScoreBpm] = useState(null) // original tempo from the score
+  const [bpmInput, setBpmInput] = useState('')
+  const [defaultBpm, setDefaultBpm] = useState(() => {
+    const v = parseInt(localStorage.getItem('nf-default-bpm'), 10)
+    return Number.isFinite(v) && v > 0 ? v : 120
+  })
+  const [defaultBpmInput, setDefaultBpmInput] = useState(String(defaultBpm))
   const [playbackSpeed, setPlaybackSpeed] = useState(1.0)
   const [playerProgress, setPlayerProgress] = useState(0)
   const [inputError, setInputError] = useState(null)
@@ -126,6 +133,7 @@ function App() {
   const vrvRef = useRef(null)            // VerovioToolkit instance
   const vrvModuleRef = useRef(null)      // Verovio WASM module
   const tempoMapRef = useRef([{ tick: 0, bpm: 120 }]) // from OSMD parse
+  const baseTimelineRef = useRef(null) // original parsed { timeline, tempoMap }, before user BPM scaling
 
   const toneSamplerRef = useRef(null)
   const tonePartRef = useRef(null)
@@ -161,6 +169,9 @@ function App() {
   useEffect(() => { autoscrollRef.current = autoscroll }, [autoscroll])
   useEffect(() => { playbackSpeedRef.current = playbackSpeed }, [playbackSpeed])
   useEffect(() => { localStorage.setItem('nf-input', inputMode) }, [inputMode])
+  useEffect(() => { localStorage.setItem('nf-default-bpm', String(defaultBpm)) }, [defaultBpm])
+  useEffect(() => { setBpmInput(bpm != null ? String(bpm) : '') }, [bpm])
+  useEffect(() => { setDefaultBpmInput(String(defaultBpm)) }, [defaultBpm])
 
   // Load song passed from FolderLibrary via sessionStorage
   useEffect(() => {
@@ -299,13 +310,17 @@ function App() {
     const xmlStr = decodeToXmlStr(musicXml)
     if (xmlStr && typeof xmlStr === 'string') {
       let cancelled = false
-      parseNoteTimelineOSMD(xmlStr)
+      parseNoteTimelineOSMD(xmlStr, { defaultBpm })
         .then(({ timeline, tempoMap }) => {
           if (cancelled) return
           setNoteTimeline(timeline)
           setCurrentNoteIndex(0)
           tempoMapRef.current = tempoMap
-          if (tempoMap && tempoMap.length > 0) setBpm(tempoMap[0].bpm)
+          baseTimelineRef.current = { timeline, tempoMap }
+          if (tempoMap && tempoMap.length > 0) {
+            setBpm(tempoMap[0].bpm)
+            setScoreBpm(tempoMap[0].bpm)
+          }
           pushDebug('osmdParsed', {
             count: timeline.length,
             bpm: tempoMap?.[0]?.bpm,
@@ -318,7 +333,7 @@ function App() {
         })
       return () => { cancelled = true }
     }
-  }, [musicXml, pushDebug])
+  }, [musicXml, pushDebug, defaultBpm])
 
   // ---------------------------------------------------------------------------
   // Verovio — render MusicXML to SVG
@@ -417,7 +432,7 @@ function App() {
     return () => { cancelled = true }
   }, [musicXml])
 
-  // (Speed is applied at listen-start time via timeSec scheduling; no mid-listen BPM change needed)
+  // (Speed and tempo overrides are applied at listen-start time via timeSec scheduling; no mid-listen update needed)
 
   // Sync Verovio cursor when note index changes (practice mode)
   useEffect(() => {
@@ -784,9 +799,52 @@ function App() {
     setCompleted(false)
     setShowHint(false)
     setBpm(null)
+    setScoreBpm(null)
+    baseTimelineRef.current = null
     setPlayerProgress(0)
     if (svgContainerRef.current) {
       svgContainerRef.current.innerHTML = ''
+    }
+  }
+
+  // Apply a user-chosen BPM by scaling the parsed timeline's absolute times.
+  // cursorSec is intentionally left at score tempo — Verovio's timemap is in
+  // score-tempo milliseconds, and the cursor lookup depends on that.
+  // Like playback speed, the change takes effect the next time listen starts.
+  function handleBpmChange(newBpm) {
+    const clamped = Math.min(240, Math.max(30, Math.round(newBpm)))
+    setBpm(clamped)
+    const base = baseTimelineRef.current
+    if (!base || !scoreBpm) return
+    const ratio = clamped / scoreBpm
+    tempoMapRef.current = base.tempoMap.map((te) => ({ tick: te.tick, bpm: te.bpm * ratio }))
+    setNoteTimeline(
+      base.timeline.map((e) => ({
+        ...e,
+        timeSec: e.timeSec != null ? e.timeSec / ratio : e.timeSec,
+        durationSec: e.durationSec != null ? e.durationSec / ratio : e.durationSec,
+      }))
+    )
+  }
+
+  function commitBpmInput() {
+    const n = parseInt(bpmInput, 10)
+    if (Number.isFinite(n)) {
+      handleBpmChange(n)
+      setBpmInput(String(Math.min(240, Math.max(30, Math.round(n)))))
+    } else {
+      setBpmInput(bpm != null ? String(bpm) : '')
+    }
+  }
+
+  function commitDefaultBpmInput() {
+    const n = parseInt(defaultBpmInput, 10)
+    if (Number.isFinite(n)) {
+      const clamped = Math.min(240, Math.max(30, Math.round(n)))
+      setDefaultBpm(clamped)
+      setDefaultBpmInput(String(clamped))
+    } else {
+      setDefaultBpmInput(String(defaultBpm))
     }
   }
 
@@ -1413,6 +1471,27 @@ function App() {
                 </div>
               </div>
 
+              {/* Default Tempo */}
+              <div>
+                <p className="text-[10px] uppercase tracking-widest mb-3" style={{color:'var(--sub)'}}>Default Tempo (BPM)</p>
+                <div className="flex items-center gap-3">
+                  <input
+                    type="number" min="30" max="240" step="1"
+                    value={defaultBpmInput}
+                    onChange={(e) => {
+                      const v = e.target.value
+                      setDefaultBpmInput(v)
+                      const n = parseInt(v, 10)
+                      if (Number.isFinite(n) && n >= 30 && n <= 240) setDefaultBpm(n)
+                    }}
+                    onBlur={commitDefaultBpmInput}
+                    onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
+                    className="w-24 rounded-lg px-3 py-2 text-sm focus:outline-none transition-colors"
+                    style={{background:'var(--bg)',border:'1px solid var(--border)',color:'var(--ink)'}}
+                  />
+                  <span className="text-xs" style={{color:'var(--sub)',opacity:.6}}>Used when the score has no tempo marking</span>
+                </div>
+              </div>
 
             </div>
           </div>
@@ -1806,6 +1885,36 @@ function App() {
                   </div>
                 </button>
               </div>
+
+              {bpm != null && (
+                <div className="mb-5">
+                  <label className="text-xs uppercase tracking-wider font-medium mb-2 block" style={{color:'var(--sub)'}}>
+                    Tempo (BPM)
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number" min="30" max="240" step="1"
+                      value={bpmInput}
+                      onChange={(e) => {
+                        const v = e.target.value
+                        setBpmInput(v)
+                        const n = parseInt(v, 10)
+                        if (Number.isFinite(n) && n >= 30 && n <= 240) handleBpmChange(n)
+                      }}
+                      onBlur={commitBpmInput}
+                      onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
+                      className="w-24 rounded-lg px-3 py-2 text-sm focus:outline-none transition-colors"
+                      style={{background:'var(--bg)',border:'1px solid var(--border)',color:'var(--ink)'}}
+                    />
+                    <span className="text-xs" style={{color:'var(--sub)',opacity:.6}}>30–240</span>
+                    {scoreBpm != null && bpm !== scoreBpm && (
+                      <button onClick={() => handleBpmChange(scoreBpm)} className="ml-auto text-xs font-medium cursor-pointer" style={{color:'var(--accent)'}}>
+                        Reset to {scoreBpm}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
 
               <div className="mb-5">
                 <label className="text-xs uppercase tracking-wider font-medium mb-2 block" style={{color:'var(--sub)'}}>
