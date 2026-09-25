@@ -32,8 +32,8 @@ export function tickToSec(tick, tempoMap) {
  * Parses all <part> elements — first part = right hand, second = left hand.
  * tempoMap is [{ tick, bpm }] tracking all mid-piece tempo changes.
  */
-export function parseNoteTimeline(xmlString) {
-  if (!xmlString || typeof xmlString !== 'string') return { timeline: [], divisions: 1, tempo: 120, tempoMap: [{ tick: 0, bpm: 120 }] }
+export function parseNoteTimeline(xmlString, defaultBpm = 120) {
+  if (!xmlString || typeof xmlString !== 'string') return { timeline: [], divisions: 1, tempo: defaultBpm, tempoMap: [{ tick: 0, bpm: defaultBpm }] }
 
   // Expand repeat barlines into a linear sequence before DOM parsing.
   xmlString = unfoldRepeats(xmlString).xml
@@ -89,7 +89,7 @@ export function parseNoteTimeline(xmlString) {
 
   // Ensure tempo map starts at tick 0
   if (tempoMap.length === 0 || tempoMap[0].tick !== 0) {
-    tempoMap.unshift({ tick: 0, bpm: 120 })
+    tempoMap.unshift({ tick: 0, bpm: defaultBpm })
   }
   // De-duplicate: if multiple entries at the same tick, keep the last one
   for (let i = tempoMap.length - 1; i > 0; i--) {

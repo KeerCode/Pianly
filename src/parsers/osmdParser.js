@@ -195,11 +195,11 @@ function buildOriginalMeasureStartTicks(xmlString) {
 }
 
 /** Extract tempo map from raw MusicXML (simple DOM walk, no OSMD needed). */
-function extractTempoMap(xmlString) {
+function extractTempoMap(xmlString, defaultBpm = 120) {
   const parser = new DOMParser()
   const doc = parser.parseFromString(xmlString, 'text/xml')
   const part = doc.querySelector('part')
-  if (!part) return [{ tick: 0, bpm: 120 }]
+  if (!part) return [{ tick: 0, bpm: defaultBpm }]
 
   const tempoMap = []
   const measures = part.querySelectorAll('measure')
@@ -241,7 +241,7 @@ function extractTempoMap(xmlString) {
   })
 
   if (tempoMap.length === 0 || tempoMap[0].tick !== 0) {
-    tempoMap.unshift({ tick: 0, bpm: 120 })
+    tempoMap.unshift({ tick: 0, bpm: defaultBpm })
   }
   for (let i = tempoMap.length - 1; i > 0; i--) {
     if (tempoMap[i].tick === tempoMap[i - 1].tick) tempoMap.splice(i - 1, 1)
@@ -254,19 +254,19 @@ function extractTempoMap(xmlString) {
  * Returns { timeline, divisions, tempoMap } with the same shape as the old parser.
  * Only extracts notes from the first instrument's first staff (right hand / treble).
  */
-export async function parseNoteTimelineOSMD(xmlString) {
+export async function parseNoteTimelineOSMD(xmlString, { defaultBpm = 120 } = {}) {
   if (!xmlString || typeof xmlString !== 'string') {
-    return { timeline: [], divisions: 1, tempoMap: [{ tick: 0, bpm: 120 }] }
+    return { timeline: [], divisions: 1, tempoMap: [{ tick: 0, bpm: defaultBpm }] }
   }
 
   // Expand repeat barlines into a linear measure sequence before any parsing.
   const { xml, order } = unfoldRepeats(xmlString)
 
-  const tempoMap = extractTempoMap(xml)
+  const tempoMap = extractTempoMap(xml, defaultBpm)
 
   // For cursor mapping back to original-score time during repeats.
   const origMeasureStartTicks = buildOriginalMeasureStartTicks(xmlString)
-  const origTempoMap = extractTempoMap(xmlString)
+  const origTempoMap = extractTempoMap(xmlString, defaultBpm)
 
   // Hidden container — OSMD needs a DOM element but we only use it for parsing
   const container = document.createElement('div')

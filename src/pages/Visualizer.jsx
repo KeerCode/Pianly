@@ -117,6 +117,12 @@ const CHORD_TICK_WINDOW = 15  // ticks — entries within this range are one cho
 // ---------------------------------------------------------------------------
 // Visualizer component
 // ---------------------------------------------------------------------------
+/** Global default BPM (Settings), used when a score has no tempo marking. */
+function getDefaultBpm() {
+  const v = parseInt(localStorage.getItem('nf-default-bpm'), 10)
+  return Number.isFinite(v) && v > 0 ? v : 120
+}
+
 export default function Visualizer() {
   const { theme } = useTheme()
 
@@ -208,14 +214,14 @@ export default function Visualizer() {
           xmlStr = new TextDecoder().decode(musicXml)
         }
         if (xmlStr) {
-          const result = parseNoteTimeline(xmlStr)
+          const result = parseNoteTimeline(xmlStr, getDefaultBpm())
           setTimeline(result.timeline); setTempo(result.tempo); setTempoMap(result.tempoMap)
         }
       } catch (err) { console.error('[Visualizer] XML parse error:', err) }
       return
     }
     if (typeof musicXml === 'string') {
-      const result = parseNoteTimeline(musicXml)
+      const result = parseNoteTimeline(musicXml, getDefaultBpm())
       setTimeline(result.timeline); setTempo(result.tempo); setTempoMap(result.tempoMap)
     }
   }, [musicXml])
