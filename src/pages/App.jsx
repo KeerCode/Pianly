@@ -448,7 +448,9 @@ function App() {
         : entry.timeSec != null
           ? entry.timeSec * 1000
           : tickToSec(entry.tick, tempoMapRef.current) * 1000
-      highlightVerovioAtMs(ms, 'instant')
+      if (!highlightVerovioFromSchedule(ms, 'instant')) {
+        highlightVerovioAtMs(ms, 'instant')
+      }
     }
   }, [mode, currentNoteIndex, noteTimeline])
 
@@ -459,6 +461,45 @@ function App() {
     svgContainerRef.current?.querySelectorAll('.current-note').forEach((el) => {
       el.classList.remove('current-note')
     })
+  }
+
+  // Highlight via the prebuilt Verovio timemap schedule instead of
+  // getElementsAtTime(): that API carries float error in its internal
+  // timestamps, so querying an exact note onset can resolve to the previous
+  // event (measure-start notes get skipped) or return two events at once.
+  // The schedule uses the timemap's own tstamps, so matching is exact.
+  function highlightVerovioFromSchedule(ms, scrollBehavior = 'smooth') {
+    const cs = vrvCursorScheduleRef.current
+    const container = svgContainerRef.current
+    if (!cs || cs.length === 0 || !container) return false
+
+    let bestIdx = -1
+    for (let i = 0; i < cs.length; i++) {
+      if (cs[i].tstampMs <= ms + 20) bestIdx = i
+      else break
+    }
+    if (bestIdx < 0) return false
+
+    clearVerovioHighlights()
+    const { ids } = cs[bestIdx]
+    for (const id of ids) {
+      const el = container.querySelector(`#${id}`)
+      if (el) el.classList.add('current-note')
+    }
+
+    if (autoscrollRef.current && ids.length > 0) {
+      const firstEl = container.querySelector(`#${ids[0]}`)
+      if (firstEl) {
+        requestAnimationFrame(() => {
+          const rect = firstEl.getBoundingClientRect()
+          const viewportH = window.innerHeight
+          if (rect.bottom > viewportH - 40 || rect.top < 80) {
+            firstEl.scrollIntoView({ block: 'center', behavior: scrollBehavior })
+          }
+        })
+      }
+    }
+    return true
   }
 
   function highlightVerovioAtMs(ms, scrollBehavior = 'smooth') {
@@ -873,36 +914,9 @@ function App() {
 
       // Highlight current note in Verovio SVG.
       // Use cursorSec (original-score time) so cursor works correctly on repeat passes.
-      const cs = vrvCursorScheduleRef.current
-      if (cs?.length > 0) {
-        const cursorMs = (tl[best]?.cursorSec ?? tl[best]?.timeSec ?? 0) * 1000
-        let bestIdx = 0
-        for (let i = 0; i < cs.length; i++) {
-          if (cs[i].tstampMs <= cursorMs) bestIdx = i
-          else break
-        }
-        clearVerovioHighlights()
-        const { ids } = cs[bestIdx]
-        const container = svgContainerRef.current
-        if (container) {
-          for (const id of ids) {
-            const el = container.querySelector(`#${id}`)
-            if (el) el.classList.add('current-note')
-          }
-          if (autoscrollRef.current && ids.length > 0) {
-            const firstEl = container.querySelector(`#${ids[0]}`)
-            if (firstEl) {
-              requestAnimationFrame(() => {
-                const rect = firstEl.getBoundingClientRect()
-                const viewportH = window.innerHeight
-                if (rect.bottom > viewportH - 40 || rect.top < 80)
-                  firstEl.scrollIntoView({ block: 'center', behavior: 'smooth' })
-              })
-            }
-          }
-        }
-      } else {
-        highlightVerovioAtMs((tl[best]?.cursorSec ?? musicalSec) * 1000)
+      const cursorMs = (tl[best]?.cursorSec ?? tl[best]?.timeSec ?? musicalSec) * 1000
+      if (!highlightVerovioFromSchedule(cursorMs)) {
+        highlightVerovioAtMs(cursorMs)
       }
 
       // Progress bar
