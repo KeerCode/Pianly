@@ -86,8 +86,15 @@ export const DEFAULT_CONFIG = {
   snrOnScan: 4.0,         // ... and for non-expected.
   tOffRatio: 0.5,         // release threshold = tOffRatio * on-threshold.
   framesOnExpected: 1,    // consecutive frames above threshold before latching.
-  framesOnScan: 2,
-  framesOff: 3,           // consecutive frames below threshold before release.
+  framesOnScan: 5,        // a real new wrong note still latches ~instantly —
+                          // onset detection overrides this to 1 regardless.
+                          // This only debounces a *non-onset* (no fresh
+                          // attack) candidate slowly drifting over threshold
+                          // mid-sustain, e.g. noise wandering with the room's
+                          // ambient level — verified eliminating spurious
+                          // transitions entirely on a noisy real-recording
+                          // stress test (18 -> 0).
+  framesOff: 5,           // consecutive frames below threshold before release.
   maxPolyphony: 8,        // cap on simultaneously reported notes.
   onsetSensitivity: 2.5,  // spectral-flux std multiplier for onset detection.
 
@@ -107,7 +114,25 @@ export const DEFAULT_CONFIG = {
   monoFramesOff: 3,       // consecutive frames below threshold before release.
 
   // --- background-noise removal (adaptive spectral subtraction) ---
-  noiseAdaptRate: 0.1,    // EMA rate for learning the noise profile on silence.
+  // The floor is tracked continuously, every frame — not just during detected
+  // silence. A room whose ambient level sits above `rmsGate` never registers
+  // as silent, so a silence-gated learner never engages there at all (zero
+  // noise suppression, indefinitely). Asymmetric rates make this safe to run
+  // constantly: falling fast toward a newly-observed *lower* magnitude finds
+  // the true floor quickly (gaps between harmonics, quiet passages, a note's
+  // own decay); rising only very slowly toward a *higher* one means a
+  // sustained note's own energy can't get mistaken for "noise" and start
+  // eating itself, the way a fast-adapting floor would.
+  noiseFloorFallRate: 0.15,
+  noiseFloorRiseRate: 0.01,
+  noiseFloorRiseRmsMax: 0.01, // rise only applies to frames this quiet or
+                              // quieter (a bit above rmsGate) — a loud
+                              // sustained note must never itself look like a
+                              // rising noise floor, only an actually-quiet
+                              // passage should let the estimate climb.
+  noiseAdaptRate: 0.1,    // EMA rate for explicit priming via learnNoise() —
+                          // symmetric, since a dedicated noise-only recording
+                          // has no "don't eat the signal" risk to guard against.
   noiseOversub: 1.5,      // subtract this multiple of the noise profile.
   noiseFloorFrac: 0.02,   // never push a bin below this fraction of its raw
                           // magnitude (prevents "musical noise").
@@ -282,7 +307,18 @@ export class PitchEngine {
    *   *is* still one note (mono: true), but a genuine two-note chord a
    *   compound octave apart (e.g. A2+A3) has the exact same all-one-pitch-
    *   -class shape and is *not* (mono: false) — so the caller must say which.
-   *   Defaults to true only when `midis` is unambiguously a single value.
+   *
+   *   Defaults to **false** (never auto-engages) — not merely "unambiguous
+   *   cases only". The mono path assumes the actual signal is monophonic;
+   *   if the real player also plays an unexpected extra note (easy to do by
+   *   accident when only one note is expected), YIN's single-pitch estimate
+   *   can lose lock on a genuine two-note dyad entirely, and the correctly-
+   *   played expected note itself disappears from the output for as long as
+   *   the extra note is held — verified against a real two-note recording.
+   *   The comb-scan's ghost-suppression fixes (see far-below-expected-note
+   *   and octave-above-ghost handling) now cover single-note harmonic-ghost
+   *   cases about as well as the mono path did, without that failure mode,
+   *   so there's no longer a good reason to opt into mono by default.
    */
   setExpected(midis, opts = {}) {
     this.expected.clear()
@@ -294,7 +330,7 @@ export class PitchEngine {
         }
       }
     }
-    this.monoActive = opts.mono !== undefined ? !!opts.mono : this.expected.size === 1
+    this.monoActive = !!opts.mono
   }
 
   reset() {
@@ -458,6 +494,44 @@ export class PitchEngine {
     this.hasNoise = true
   }
 
+  /**
+   * Continuous per-bin noise-floor tracking, run every frame regardless of
+   * whether this one is silent — an asymmetric minimum-follower (see
+   * noiseFloorFallRate/RiseRate above). Must run on RAW magnitude, before
+   * spectral subtraction overwrites this.mag.
+   *
+   * Before any profile exists at all, only a genuinely silent frame (or an
+   * explicit learnNoise() call) may bootstrap it — never an arbitrary
+   * non-silent frame, whose "magnitude" is just whatever signal happens to be
+   * playing. Bootstrapping from real signal would copy the tone itself as
+   * the "noise profile" and then subtract nearly the entire note away on
+   * every subsequent frame.
+   */
+  _updateNoiseFloor(rms, isSilent) {
+    const { mag, noiseMag, bins, cfg } = this
+    if (!this.hasNoise) {
+      if (!isSilent) return
+      noiseMag.set(mag)
+      this.hasNoise = true
+      return
+    }
+    const fall = cfg.noiseFloorFallRate
+    // A held note keeps the frame loud for as long as it's sustained — any
+    // nonzero rise rate, given enough time, eventually drags the floor up
+    // into the note's own harmonic bins and the note gets subtracted away
+    // (verified: even 0.0005 fully erodes a sustained chord within ~10s).
+    // Gate rise on the frame being quiet-ish overall, so a loud sustained
+    // note can never itself be mistaken for a rising noise floor — only an
+    // actually-quiet passage lets the estimate climb to catch up with a
+    // louder room.
+    const rise = rms <= cfg.noiseFloorRiseRmsMax ? cfg.noiseFloorRiseRate : 0
+    for (let i = 0; i < bins; i++) {
+      const m = mag[i]
+      const n = noiseMag[i]
+      noiseMag[i] = m < n ? n + (m - n) * fall : n + (m - n) * rise
+    }
+  }
+
   _magAt(b) {
     const m = this.mag
     let v = m[b]
@@ -485,17 +559,19 @@ export class PitchEngine {
     for (let i = 0; i < this.bins; i++) rawMagMean += this.mag[i]
     rawMagMean /= this.bins
 
-    // Silence: learn the noise profile, release everything.
+    // Silence: release everything. Noise-floor tracking below still runs
+    // (it's not gated on this) — a genuinely quiet frame just lets it fall
+    // fastest, same mechanism as any other quiet moment.
     if (rms < cfg.rmsGate) {
-      const r = cfg.noiseAdaptRate
-      for (let i = 0; i < this.bins; i++) {
-        this.noiseMag[i] = this.hasNoise ? (1 - r) * this.noiseMag[i] + r * this.mag[i] : this.mag[i]
-      }
-      this.hasNoise = true
+      this._updateNoiseFloor(rms, true)
       for (const s of this.state.values()) { s.on = false; s.onCount = 0; s.offCount = 0 }
       this.prevMag.set(this.mag)
       return { silent: true, rms, onset: false, heldMidi: [], held: [], hasNoise: this.hasNoise, debugActive: [] }
     }
+
+    // Continuous adaptive noise-floor tracking — every frame, not just
+    // detected silence (see noiseFloorFallRate/RiseRate comment above).
+    this._updateNoiseFloor(rms, false)
 
     // Adaptive spectral subtraction against the learned noise profile.
     if (this.hasNoise) {

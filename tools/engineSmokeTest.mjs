@@ -22,7 +22,7 @@ const noise = (buf, amp) => { for (let i = 0; i < buf.length; i++) buf[i] += (Ma
 const frame = () => new Float32Array(N)
 
 // Feed the same stimulus a few times so hysteresis (framesOnScan) latches.
-function detect(engine, makeFrame, reps = 4) {
+function detect(engine, makeFrame, reps = 6) {
   let r
   for (let i = 0; i < reps; i++) r = engine.process(makeFrame())
   return r
@@ -215,6 +215,39 @@ for (const m of [48, 60, 72]) {
   e.setExpected([60, 72]) // C3 + C4
   const r = detect(e, () => tone(frame(), [60, 72]))
   check('C3+C4 both expected -> both detected', JSON.stringify(r.heldMidi) === JSON.stringify([60, 72]), `got [${r.heldMidi}]`)
+}
+
+// 16. Expected a single note (A2), but an extra unexpected note (C3) is also
+//     genuinely played — must NOT default to the monophonic path, which
+//     assumes the signal is monophonic and can lose lock on a real two-note
+//     dyad entirely, silently dropping the correctly-played expected note
+//     from the output for as long as the extra note is held (reproduced
+//     against a real two-note piano recording: A2 vanished for several
+//     seconds despite being continuously and correctly played). Pins
+//     setExpected's default (mono: false unless explicitly requested).
+{
+  const e = new PitchEngine(SR)
+  e.setExpected([57]) // A2 only
+  check('single expected note defaults to polyphonic (mono: false)', e.monoActive === false, `monoActive=${e.monoActive}`)
+  const r = detect(e, () => tone(frame(), [57, 60]), 30) // A2 (expected) + C3 (extra), held a while
+  check('expected A2 + unexpected extra C3 -> A2 still held, not dropped', r.heldMidi.includes(57), `got [${r.heldMidi}]`)
+}
+
+// 17. Continuous background noise (never learned via a silent frame, and
+//     above rmsGate the whole time) must not erode a long-held chord over
+//     time. The noise floor's per-bin rise is gated on frame RMS
+//     specifically to prevent this — verified directly: with that gate
+//     removed, a sustained chord fully disappeared within ~5s of noisy
+//     playback as the floor crept up into the notes' own harmonic bins.
+{
+  const e = new PitchEngine(SR)
+  e.setExpected([57, 60]) // A2, C3
+  let r
+  for (let i = 0; i < 240; i++) { // 240 * 25ms hop-equivalent reps ~= 6s of sustained noisy playback
+    r = e.process(noise(tone(frame(), [57, 60]), 0.012)) // noise amp well above default rmsGate
+  }
+  check('sustained chord under continuous unlearned noise -> not eroded away',
+    JSON.stringify(r.heldMidi) === JSON.stringify([57, 60]), `got [${r.heldMidi}]`)
 }
 
 console.log(`\n${pass} passed, ${fail} failed`)

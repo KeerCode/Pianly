@@ -58,34 +58,32 @@ reaction time in milliseconds — keep it at 8192 or 4096 there.
 
 ---
 
-## Monophonic path (exactly one expected note)
+## Monophonic path (opt-in only — `setExpected(midis, { mono: true })`)
 
-When exactly one *musical note* is expected, `process()` skips the spectral
-harmonic-comb scan entirely and uses `_monoPitch()` instead — a YIN-style
-time-domain pitch estimate (cumulative mean normalized difference function,
-derived from an FFT-based autocorrelation in O(maxLag) rather than YIN's
-usual O(N·maxLag)). This is what actually fixes "single note → several notes
-shown": a real note's own upper partials (octave, fifth) can independently
-clear the comb-scan's non-expected threshold and get reported as separate
-phantom notes, since the comb scan scores every candidate pitch's harmonic
-series independently. Time-domain periodicity instead estimates the *one*
-true fundamental period directly — a harmonic's own (shorter) period isn't
-implied by periodicity at the true period, so it doesn't fool this method the
-same way. Chords (2+ notes) still use the comb scan (YIN has no polyphony
-story).
+When explicitly requested, `process()` skips the spectral harmonic-comb scan
+entirely and uses `_monoPitch()` instead — a YIN-style time-domain pitch
+estimate (cumulative mean normalized difference function, derived from an
+FFT-based autocorrelation in O(maxLag) rather than YIN's usual O(N·maxLag)).
+It estimates the *one* true fundamental period directly, so a note's own
+upper partials can't get mistaken for a second note the spectral comb-scan
+way (a harmonic's own shorter period isn't implied by periodicity at the true
+period).
 
-**"One note" is not the same as "one MIDI number in `expected`"** — whether to
-take this path is a `setExpected(midis, { mono })` option, not something
-inferred from `midis` itself, because it's genuinely ambiguous from the set
-alone: "any octave" mode expands a single target note into every octave of
-its pitch class (still one note — `mono: true`), but a real two-note chord a
-compound octave apart, e.g. A2+A3, has the *exact same* all-one-pitch-class
-shape and needs both notes detected (`mono: false`). Get this wrong in either
-direction and you get this section's failure mode back, or "two notes
-expected, only one ever shown" (the chord collapsing onto whichever one YIN's
-single-pitch estimate finds). Omitting `opts.mono` defaults to
-`expected.size === 1`, which is only safe when the caller isn't doing any
-octave-expansion of a single note — pass it explicitly whenever you do.
+**Not used by default, and not wired into the app.** It assumes the real
+signal actually is monophonic — if the player also hits an unexpected extra
+note (easy to do by accident when only one note is expected), YIN's
+single-pitch estimate can lose lock on the resulting two-note dyad entirely,
+and the correctly-played expected note disappears from the output for as
+long as the extra note is held. Verified against a real two-note piano
+recording: expected `[A2]`, actually played A2+C3 — in mono mode A2 vanished
+completely for several seconds despite being continuously played correctly.
+The comb-scan's ghost-suppression fixes (far-below-expected-note harmonics,
+octave-above ghosts — see below) now handle the single-note harmonic-ghost
+case about as well as mono mode did, without that failure mode, so `mono` now
+defaults to `false` unconditionally — pass `{ mono: true }` explicitly only
+if you have a use case where the signal is *guaranteed* monophonic (no
+possibility of an extra note) and want YIN's slightly better bass-note
+precision.
 
 | knob | default | move to | effect |
 |------|---------|---------|--------|
@@ -94,9 +92,8 @@ octave-expansion of a single note — pass it explicitly whenever you do.
 | `monoFramesOff` | 3 | 5–6 | held note stops dropping out mid-sustain |
 
 `npm run analyze` doesn't currently drive this path (it always calls the
-comb-scan tunables) — to test it, call `engine.setExpected([midi])` before
-`engine.process(frame)` in a small script, or exercise it in-app with a single
-target note.
+comb-scan tunables) — to test it, call `engine.setExpected([midi], { mono:
+true })` before `engine.process(frame)` in a small script.
 
 ---
 
@@ -110,7 +107,7 @@ target note.
 | `minLowHarmonics` | 2 | 1 | accept notes with a weak/absent fundamental (helps A0–C2, and near-pure tones); costs some spurious-bass rejection |
 | `harmonicRolloff` | 0.7 | 0.5 | weight upper harmonics more → better weak-fundamental bass |
 | `maxHarmonics` | 10 | 12–16 | more evidence per note (mainly low/mid) |
-| `framesOff` | 3 | 5–6 | held notes stop dropping out mid-sustain |
+| `framesOff` | 5 | 6–8 | held notes stop dropping out mid-sustain |
 | `tOffRatio` | 0.5 | 0.3–0.4 | notes "stick" through dips (legato, pedal) |
 
 ## False notes / phantom extras
@@ -119,21 +116,31 @@ target note.
 |------|---------|---------|--------|
 | `tOnScan` | 0.30 | 0.35–0.45 | non-expected pitch needs much more energy — kills harmonic/phantom extras that block chord advance |
 | `snrOnScan` | 4.0 | 5–8 | reject notes that are barely above the frame floor |
-| `framesOnScan` | 2 | 3 | ignore single-frame transients |
+| `framesOnScan` | 5 | 6–8 | ignore single-frame transients. A *real* new wrong note still latches ~instantly regardless — a fresh attack triggers onset detection, which overrides this to 1 frame. This only debounces a candidate with no fresh attack slowly drifting over threshold mid-sustain (e.g. noise wandering with the room's ambient level) — raising it from the old default of 2 eliminated persistent flicker on a noisy real-recording stress test entirely (verified via `analyzeAudio.mjs --csv`) |
 | `minLowHarmonics` | 2 | 3 | stricter "is this a real tone" test (needs a fuller harmonic series) |
 | `noiseGateRatio` | 3.0 | 4–6 | (only with a learned noise profile) a note must beat the noise's own comb energy by this factor |
 | `maxPolyphony` | 8 | 5 | hard cap when you know the material is ≤5 voices |
 
 ## Octave errors (detects the note an octave off)
 
-| knob | default | move to | effect |
-|------|---------|---------|--------|
-| `harmonicRolloff` | 0.7 | 1.0–1.3 | trust the fundamental far more than upper harmonics (where octave ghosts live) |
-| `tOnScan` | 0.30 | 0.40 | ghost has to be really strong to register |
+The engine suppresses octave / twelfth / two-octave ghosts whenever the
+*other*, real pitch is confirmed. For a note *above* a real note specifically
+(m-12/-19/-24), this suppression does **not** additionally require the
+ghost's own fundamental to look weak — verified on a real recorded C3: its
+2nd harmonic (exactly C4's fundamental frequency) measured 2.9-3.6x
+*stronger* than its own true fundamental, so "own fundamental is weak" is not
+a valid discriminator here. Every harmonic of the note an octave above is
+also an exact harmonic of the note below, so no amplitude pattern can tell
+"one note with a loud 2nd harmonic" from "two notes an octave apart" — this
+is a permanent ambiguity, not something `harmonicRolloff` fixes (tested
+directly against real audio: raising it 0.7 → 1.3 made no difference to this
+failure mode). A deliberately octave-doubled target still detects fine, since
+it's then in `expected` and this suppression only touches non-expected
+candidates.
 
-The engine already suppresses octave / twelfth / two-octave ghosts, but only
-when the *other* pitch has a real fundamental. If octaves are still leaking,
-raising `harmonicRolloff` is the biggest lever.
+`harmonicRolloff` (0.7, try 1.0–1.3) still helps the *original* octave-ghost
+shape this section used to describe — a low candidate's own comb trusting
+upper harmonics too much — just not the above-a-real-note case.
 
 ## Onset / timing feels laggy or jittery
 
@@ -154,17 +161,38 @@ Always on:
   thumps. Below A0 (27.5 Hz), so it never touches a real note. Raise to 40–50 if
   you have strong low-frequency hum; lower toward 25 only if you actually play
   the bottom octave.
-- **Adaptive spectral subtraction** — every frame classified as silence
-  (`rms < rmsGate`) is averaged into a per-bin noise profile
-  (`noiseAdaptRate`, EMA). Live frames get `mag -= noiseOversub * noise`, floored
-  at `noiseFloorFrac * mag`.
+- **Continuous adaptive spectral subtraction** — the noise floor is tracked
+  every frame, not just ones classified as silence, via an asymmetric
+  per-bin minimum-follower (`_updateNoiseFloor`): falls fast toward a newly
+  observed *lower* magnitude (`noiseFloorFallRate`), rises only very slowly
+  toward a higher one (`noiseFloorRiseRate`), and that rise is further gated
+  off entirely whenever the frame itself isn't quiet
+  (`noiseFloorRiseRmsMax`). This replaced a silence-gated learner (only ever
+  updated when `rms < rmsGate`) that silently did nothing at all whenever the
+  room's ambient level sat above `rmsGate` — a real, easy-to-hit
+  miscalibration, not an edge case; `rmsGate` still needs the same per-room
+  calibration below, but the profile no longer depends on true silence ever
+  occurring to start working.
+
+  The rise side is deliberately cautious: verified that *any* nonzero rise
+  rate, given long enough, drags the floor up into a sustained note's own
+  harmonic bins and the note gets subtracted away entirely (a held chord
+  fully disappeared within ~5s at `noiseFloorRiseRate: 0.01` with rise
+  ungated). Gating rise on frame RMS fixes this — a loud sustained note can
+  never itself look like "the noise floor rising", only an actually-quiet
+  passage lets the estimate climb to catch up with a louder room. Live
+  frames get `mag -= noiseOversub * noise`, floored at `noiseFloorFrac * mag`,
+  same as before.
 
 | knob | default | move to | effect |
 |------|---------|---------|--------|
 | `noiseOversub` | 1.5 | 2.0–2.5 | subtract more aggressively (steady hum, fan) — too high thins real notes |
 | `noiseFloorFrac` | 0.02 | 0.05 | leave more residual — fewer "musical noise" artifacts, less clean |
-| `noiseAdaptRate` | 0.1 | 0.03 | noise profile changes more slowly (stable room) |
+| `noiseFloorFallRate` | 0.15 | 0.05–0.1 | floor settles onto a new lower level more slowly (fewer false "quiet" moments mistaken for the true floor) |
+| `noiseFloorRiseRate` | 0.01 | lower, not higher | if you suspect floor creep — see the sustained-note-erosion note above before raising this |
+| `noiseFloorRiseRmsMax` | 0.01 | raise a little | if the floor won't catch up fast enough after real ambient noise increases (rare) |
 | `noiseGateRatio` | 3.0 | 4–6 | stricter reject of notes that are just structured noise |
+| `noiseAdaptRate` | 0.1 | 0.03 | only affects explicit priming via `learnNoise()` / `--noise room.wav` — symmetric EMA, unrelated to the continuous tracker above |
 
 Prime the profile from a dedicated recording instead of waiting for silent
 frames:
