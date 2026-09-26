@@ -8,7 +8,7 @@ import { DEMO_PIECES, loadDemoScore } from '../data/demoScores'
 import { noteNameToMidi, getInterval } from '../utils/noteConversion'
 import { getSavedFolder, pickFolder, listScores, loadScore } from '../lib/scoreFolder'
 import { enableMidi, listenToDevice, notesMatch, onDevicesChanged } from '../input/midiInput'
-import { startBasicPitchDetection, loadBasicPitchModel, isBasicPitchReady } from '../input/pitchDetector'
+import { startPredictiveDetection } from '../input/predictiveDetector'
 import { parseNoteTimelineOSMD } from '../parsers/osmdParser'
 import { tickToSec } from '../parsers/parseTimeline'
 import Background from '../Background'
@@ -39,6 +39,21 @@ function decodeToXmlStr(musicXml) {
     try { return new TextDecoder().decode(musicXml) } catch { return null }
   }
   return null
+}
+
+/** Convert target note names to expected MIDI numbers for the predictive detector.
+ * With `anyOctave`, expands each pitch class to every octave in the detector's range
+ * so the score-informed prior applies regardless of which octave is played. */
+function notesToExpectedMidi(notes, anyOctave) {
+  if (!notes) return []
+  const midis = notes.map(noteNameToMidi).filter((m) => m != null)
+  if (!anyOctave) return midis
+  const classes = new Set(midis.map((m) => ((m % 12) + 12) % 12))
+  const out = []
+  for (let m = 21; m <= 108; m++) {
+    if (classes.has(((m % 12) + 12) % 12)) out.push(m)
+  }
+  return out
 }
 
 /**
@@ -127,6 +142,7 @@ function App() {
   const [modelReady, setModelReady] = useState(false)
   const [showDebug, setShowDebug] = useState(false)
   const [debugLog, setDebugLog] = useState([])
+  const [micDebug, setMicDebug] = useState(null) // live predictive-detector candidate breakdown
 
   const fileInputRef = useRef(null)
   const svgContainerRef = useRef(null)   // Verovio SVG output container
@@ -144,6 +160,8 @@ function App() {
 
   const stopListenerRef = useRef(null)
   const stopMicRef = useRef(null)
+  const setExpectedRef = useRef(null)   // predictive detector's setExpected(midis), while mic practice is running
+  const lastMicDebugAtRef = useRef(0)
   const advanceCooldownRef = useRef(false)
   const wrongTimerRef = useRef(null)
 
@@ -242,18 +260,20 @@ function App() {
     }
   }, [])
 
-  // Preload Basic Pitch model when mic mode is selected
+  // Predictive detector needs no model load — it's a plain FFT, ready instantly.
   useEffect(() => {
     if (inputMode !== 'mic') return
-    if (isBasicPitchReady()) {
-      setModelReady(true)
-      return
-    }
-    setModelLoading(true)
-    loadBasicPitchModel()
-      .then(() => { setModelReady(true); setModelLoading(false) })
-      .catch((err) => { console.error('[BasicPitch] Model load failed:', err); setModelLoading(false) })
+    setModelLoading(false)
+    setModelReady(true)
   }, [inputMode])
+
+  // Keep the live detector's expected-note prior in sync with the current target
+  // while mic practice is running.
+  useEffect(() => {
+    if (mode !== 'practice' || inputMode !== 'mic') return
+    const target = noteTimeline[currentNoteIndex]
+    setExpectedRef.current?.(notesToExpectedMidi(target?.notes, anyOctave), { mono: target?.notes?.length === 1 })
+  }, [mode, inputMode, currentNoteIndex, noteTimeline, anyOctave])
 
   // Check microphone permission
   useEffect(() => {
@@ -714,6 +734,8 @@ function App() {
     stopListenerRef.current = null
     stopMicRef.current?.()
     stopMicRef.current = null
+    setExpectedRef.current = null
+    setMicDebug(null)
     clearTimeout(wrongTimerRef.current)
     wrongTimerRef.current = null
     heldNotesRef.current.clear()
@@ -1082,8 +1104,17 @@ function App() {
             handleRelease()
           }
         }
-        const stop = await startBasicPitchDetection(onNotes)
+        const expected = notesToExpectedMidi(noteTimeline[0]?.notes, anyOctave)
+        const mono = noteTimeline[0]?.notes?.length === 1
+        const onDebug = (info) => {
+          const now = performance.now()
+          if (now - lastMicDebugAtRef.current < 120) return
+          lastMicDebugAtRef.current = now
+          setMicDebug(info)
+        }
+        const { stop, setExpected } = await startPredictiveDetection({ onNotes, expected, mono, onDebug })
         stopMicRef.current = stop
+        setExpectedRef.current = setExpected
       } catch (err) {
         const denied = err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError'
         setInputError(
@@ -1628,7 +1659,7 @@ function App() {
               {inputMode === 'mic' ? (
                 <>
                   <span className={`inline-block w-1.5 h-1.5 rounded-full ${modelLoading ? 'animate-pulse' : ''}`} style={{background:'var(--accent)'}} />
-                  <span>Microphone (Basic Pitch){modelLoading && ' — loading model...'}</span>
+                  <span>Microphone</span>
                 </>
               ) : selectedDevice ? (
                 <>
@@ -1955,15 +1986,9 @@ function App() {
               {inputMode === 'mic' && (
                 <div className="mb-5">
                   <label className="text-xs uppercase tracking-wider font-medium mb-2 block" style={{color:'var(--sub)'}}>Detection Engine</label>
-                  <p className="text-sm" style={{color:'var(--ink)'}}>Basic Pitch (Spotify ML)</p>
-                  <p className="text-[10px] mt-1.5" style={{color:'var(--sub)',opacity:.5}}>ML-powered polyphonic note detection. Supports chords.</p>
-                  {modelLoading && (
-                    <div className="flex items-center gap-2 mt-2 text-xs" style={{color:'var(--sub)'}}>
-                      <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
-                      Loading audio model...
-                    </div>
-                  )}
-                  {modelReady && <p className="text-[10px] mt-2" style={{color:'var(--ink)'}}>Model ready</p>}
+                  <p className="text-sm" style={{color:'var(--ink)'}}>Score-informed pitch detector</p>
+                  <p className="text-[10px] mt-1.5" style={{color:'var(--sub)',opacity:.5}}>FFT-based detection weighted toward the notes the score expects next. Supports chords.</p>
+                  {modelReady && <p className="text-[10px] mt-2" style={{color:'var(--ink)'}}>Ready</p>}
                 </div>
               )}
 
@@ -2029,6 +2054,26 @@ function App() {
           <button onClick={handleListen} className="w-9 h-9 flex items-center justify-center rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 hover:bg-red-500/20 hover:text-red-300 transition-colors cursor-pointer" aria-label="Stop">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
           </button>
+        </div>
+      )}
+
+      {/* Live predictive-detector breakdown — every held candidate and why it fired */}
+      {mode === 'practice' && inputMode === 'mic' && micDebug && (
+        <div className="fixed bottom-4 right-4 z-[100] w-72 rounded-xl p-3 font-mono text-[10px] leading-relaxed shadow-2xl" style={{background:'oklch(0.12 0.025 270 / 0.95)',border:'1px solid var(--border)'}}>
+          <div className="flex items-center justify-between mb-1.5">
+            <span className="font-bold text-xs" style={{color:'var(--sub)'}}>Mic detector</span>
+            <span style={{color: micDebug.hasNoise ? '#4ade80' : '#f59e0b'}}>
+              {micDebug.hasNoise ? 'noise profile learned' : 'no noise profile yet'}
+            </span>
+          </div>
+          <div className="mb-1.5" style={{color:'var(--sub)',opacity:.7}}>rms {micDebug.rms.toFixed(4)}</div>
+          {micDebug.active.length === 0 && <p style={{color:'var(--sub)',opacity:.5}}>Nothing held.</p>}
+          {micDebug.active.map((a) => (
+            <div key={a.midi} className="flex items-center justify-between" style={{color: a.expected ? '#4ade80' : '#f87171'}}>
+              <span>{a.name}{a.expected ? ' (expected)' : ' (extra)'}</span>
+              <span>rel {a.rel} · snr {a.snr}</span>
+            </div>
+          ))}
         </div>
       )}
 

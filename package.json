@@ -8,8 +8,10 @@
     "build": "vite build",
     "lint": "oxlint",
     "preview": "vite preview",
+    "test:detector": "node tools/engineSmokeTest.mjs",
+    "analyze": "node tools/analyzeAudio.mjs",
     "tauri": "tauri",
-    "tauri:mic": "tauri build --debug && codesign --force --sign - --entitlements src-tauri/Entitlements.plist src-tauri/target/debug/bundle/macos/Pianly.app && open src-tauri/target/debug/bundle/macos/Pianly.app"
+    "tauri:mic": "tauri build --debug --bundles app && codesign --force --sign - --entitlements src-tauri/Entitlements.plist src-tauri/target/debug/bundle/macos/Pianly.app && open src-tauri/target/debug/bundle/macos/Pianly.app"
   },
   "dependencies": {
     "@coderline/alphatab": "^1.8.3",
