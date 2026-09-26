@@ -180,5 +180,42 @@ for (const m of [48, 60, 72]) {
   check('B3 harmonics -> no far-below-expected G1 ghost', !r.heldMidi.includes(43), `got [${r.heldMidi}]`)
 }
 
+// 14. Octave-above ghost with a dominant 2nd harmonic — the exact ratio found
+//     analyzing a real recorded piano note (fund[C4] ≈ 3x fund[C3], not
+//     weaker as the old check assumed). A2+C3 expected and played; C4 (an
+//     octave above C3) must not appear as an extra note even though its
+//     "own fundamental" bin (really C3's 2nd harmonic) is the strongest
+//     single partial in the whole signal.
+{
+  const e = new PitchEngine(SR)
+  e.setExpected([57, 60]) // A2, C3
+  const r = detect(e, () => {
+    const buf = frame()
+    const add = (m, gains) => {
+      const f0 = midiToFreq(m)
+      gains.forEach((a, i) => {
+        const k = i + 1
+        for (let n = 0; n < buf.length; n++) buf[n] += a * Math.sin((2 * Math.PI * k * f0 * n) / SR)
+      })
+    }
+    add(60, [1, 3, 0.5, 0.3, 0.2, 0.1]) // C3, dominant 2nd harmonic (real-recording ratio)
+    add(57, [1, 0.7, 0.5, 0.3])         // A2, ordinary profile
+    return buf
+  })
+  check('A2+C3, dominant C3 2nd harmonic -> no octave-above C4 ghost',
+    !r.heldMidi.includes(72), `got [${r.heldMidi}]`)
+}
+
+// 15. A genuinely expected octave-doubled chord (C3+C4 both required, not
+//     just one note with a strong 2nd harmonic) must still detect both —
+//     the fix for test 14 only suppresses non-expected candidates, so a
+//     deliberate doubling in the score is unaffected.
+{
+  const e = new PitchEngine(SR)
+  e.setExpected([60, 72]) // C3 + C4
+  const r = detect(e, () => tone(frame(), [60, 72]))
+  check('C3+C4 both expected -> both detected', JSON.stringify(r.heldMidi) === JSON.stringify([60, 72]), `got [${r.heldMidi}]`)
+}
+
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail ? 1 : 0)

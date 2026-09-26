@@ -572,13 +572,31 @@ export class PitchEngine {
     }
 
     // Ghost suppression for non-expected pitches.
-    //  - "above" ghost: m echoes the upper harmonics of a strong lower note
-    //    (m-12 octave, m-19 twelfth) — suppress when m's own fundamental is weak.
+    //  - "above" ghost: m sits an octave/twelfth/2-octaves above a strong
+    //    lower note (m-12/-19/-24) — suppressed unconditionally (given the
+    //    other checks below) whenever that lower note is real. NOT gated on
+    //    "m's own fundamental is weak": that assumption is false for real
+    //    piano audio. Every harmonic of the note an octave above is *also*
+    //    an exact harmonic of the note below (2:1 ratio), and a struck
+    //    string's 2nd harmonic is very often *louder* than its own
+    //    fundamental — so m's "own fundamental" bin (really the lower note's
+    //    2nd harmonic) being strong proves nothing about whether m is a real
+    //    second note. There is no spectral amplitude pattern that can tell
+    //    the two cases apart; this is a genuine, permanent ambiguity, not a
+    //    threshold to tune. Tradeoff: this can't flag an accidental extra
+    //    note that happens to be an octave above a correct one — accepted,
+    //    since a deliberate octave-doubled target still detects fine (m is
+    //    then in `expected`, so this whole block doesn't apply to it).
     //  - "below" ghost: m's comb aliases a strong higher note that sits on m's
     //    harmonics (m+12 / +19 / +24) and m has no real fundamental of its own.
     //    Only fire when the *other* note has a genuine fundamental, so a phantom
     //    bass note (whose comb happens to alias several real notes) can't
-    //    suppress a real note an octave above it.
+    //    suppress a real note an octave above it. Unlike the "above" case,
+    //    m's own fundamental *is* a valid test here: a notionally lower
+    //    fundamental frequency doesn't receive energy just because a note an
+    //    octave above it is sounding (none of that note's harmonics land
+    //    there), so a real simultaneous low note should still show genuine
+    //    low-frequency energy of its own.
     //  - far-below-expected ghost: a bass candidate's comb packs up to
     //    maxHarmonics partials into the same range a treble note occupies with
     //    just its first few — the 5th, 6th, ... harmonic (≈28, 31, 34, 36, 38,
@@ -599,8 +617,9 @@ export class PitchEngine {
         if (gf(m + 12) > realFund && g(m + 12) > 0.6 * raw[m] && fx < 0.5 * gf(m + 12)) sal[m] *= 0.15
         else if (gf(m + 24) > realFund && g(m + 24) > 0.6 * raw[m] && fx < 0.5 * gf(m + 24)) sal[m] *= 0.15
         else if (gf(m + 19) > realFund && g(m + 19) > 0.7 * raw[m] && fx < 0.4 * gf(m + 19)) sal[m] *= 0.25
-        else if (gf(m - 12) > realFund && g(m - 12) > 0.6 * raw[m] && fx < 0.9 * gf(m - 12)) sal[m] *= 0.15
-        else if (gf(m - 19) > realFund && g(m - 19) > 0.7 * raw[m] && fx < 0.7 * gf(m - 19)) sal[m] *= 0.25
+        else if (gf(m - 12) > realFund && g(m - 12) > 0.6 * raw[m]) sal[m] *= 0.15
+        else if (gf(m - 24) > realFund && g(m - 24) > 0.6 * raw[m]) sal[m] *= 0.15
+        else if (gf(m - 19) > realFund && g(m - 19) > 0.7 * raw[m]) sal[m] *= 0.25
         else {
           for (const e of this.expected) {
             if (e - m >= cfg.expectedGhostSpanSemitones && fx < 0.5 * gf(e)) { sal[m] *= 0.15; break }
