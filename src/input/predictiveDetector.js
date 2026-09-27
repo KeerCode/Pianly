@@ -110,8 +110,23 @@ export const DEFAULT_CONFIG = {
                              // periodic). Standard YIN range is 0.1-0.2.
                              // Raise toward 0.2 if it feels deaf; lower toward
                              // 0.1 if it's fooled by noise/inharmonicity.
-  monoFramesOn: 1,        // consecutive frames above threshold before latching.
-  monoFramesOff: 3,       // consecutive frames below threshold before release.
+  monoCmndfWeak: 0.3,     // looser CMNDF gate for a spectrally-verified weak dip
+                          // (weak-fundamental bass); see _monoPitch.
+  monoHarmonicMean: 10,   // every YIN estimate is spectrally verified: >=2 of its
+                          // first 4 harmonics must exceed this multiple of the
+                          // frame's mean magnitude (rejects a dyad's phantom
+                          // "missing fundamental").
+  monoOctaveOddMean: 12,  // octave-up correction: the octave-below's odd
+  monoOctaveOddRel: 0.02, // harmonics must both exceed this multiple of the
+                          // mean magnitude AND this fraction of the estimate's
+                          // own strength before the estimate is dropped 12.
+  monoFramesOn: 1,        // consecutive confident frames before latching.
+  monoSwitchFrames: 3,    // frames a *different* pitch must persist before it
+                          // replaces the latched note (a fresh attack switches
+                          // immediately) — stops decay-time octave flicker.
+  monoFallbackFrames: 6,  // consecutive frames of YIN having no confident pitch
+                          // before handing over to the comb-scan (dyads, chords,
+                          // noise). Until then the last note is held (coasts).
 
   // --- background-noise removal (adaptive spectral subtraction) ---
   // The floor is tracked continuously, every frame — not just during detected
@@ -291,7 +306,7 @@ export class PitchEngine {
     this.expected = new Set()
     this.monoActive = false  // true when `expected` is a single pitch class (any octave)
     this.state = new Map()   // midi -> { on, onCount, offCount }
-    this.monoState = { midi: null, onCount: 0, offCount: 0 } // single-note (autocorrelation) path
+    this.monoState = { midi: null, onCount: 0, unconfident: 0, candMidi: null, candCount: 0, combLive: false } // single-note YIN path
     this.fluxMean = 0
     this.fluxVar = 1
     this.prevFluxNorm = 0
@@ -335,7 +350,7 @@ export class PitchEngine {
 
   reset() {
     this.state.clear()
-    this.monoState = { midi: null, onCount: 0, offCount: 0 }
+    this.monoState = { midi: null, onCount: 0, unconfident: 0, candMidi: null, candCount: 0, combLive: false }
     this.prevMag.fill(0)
     this.fluxMean = 0
     this.fluxVar = 1
@@ -412,7 +427,7 @@ export class PitchEngine {
    * curve be derived from the one FFT-based autocorrelation in O(maxLag),
    * instead of YIN's usual O(N·maxLag) direct computation.
    */
-  _monoPitch(frame) {
+  _monoPitch(frame, rawMagMean) {
     this._rawFFT(frame)
     this._autocorrFromSpectrum()
     const { re, cand, cfg } = this
@@ -445,6 +460,24 @@ export class PitchEngine {
       }
     }
 
+    // Weak tier: piano bass notes often have a weak fundamental, which
+    // shallows the dip (measured: a correctly-estimated F0 sits at CMNDF
+    // 0.20-0.25, just over the strict gate, for its whole sustain). Take the
+    // first local minimum under the looser threshold — first, not global, so
+    // a period-multiple (octave-below) dip can't win — but only if the
+    // spectrum independently confirms a real pitched tone there (below, same
+    // check every estimate gets).
+    let weak = false
+    if (foundTau < 0) {
+      for (let tau = 2; tau < maxLag; tau++) {
+        if (cmndf[tau] < cfg.monoCmndfWeak && cmndf[tau] <= cmndf[tau - 1] && cmndf[tau] <= cmndf[tau + 1]) {
+          foundTau = tau
+          weak = true
+          break
+        }
+      }
+    }
+
     const bestTau = foundTau > 0 ? foundTau : globalBestTau
     const bestCmndf = foundTau > 0 ? cmndf[bestTau] : globalBestCmndf
     const freq = this.sr / bestTau
@@ -454,22 +487,162 @@ export class PitchEngine {
       const diff = Math.abs(Math.log2(freq / c.f0))
       if (diff < bestDiff) { bestDiff = diff; bestMidi = c.midi }
     }
-    return { midi: bestMidi, confidence: 1 - Math.min(1, bestCmndf), confident: foundTau > 0 }
+
+    // Spectral checks below use the frame's mean raw bin magnitude as the
+    // noise-level yardstick (pre-subtraction, so its scale is stable).
+    let mean = rawMagMean
+    if (mean === undefined) {
+      mean = 0
+      for (let i = 0; i < this.bins; i++) mean += this.mag[i]
+      mean /= this.bins
+    }
+    const at = (hz) => this._magAt(Math.round(hz / this.binHz))
+    const f0Of = (m) => 440 * Math.pow(2, (m - 69) / 12)
+
+    // Octave-up correction. When the fundamental is weaker than the 2nd
+    // harmonic (routine for a struck piano string, and it changes during the
+    // decay: a real C3 read correctly for 1.6s, then as C4 for 2.6s more),
+    // the signal is nearly periodic at half the true period and YIN takes
+    // the shorter lag. CMNDF alone can't tell "C4" from "C3 with a weak
+    // fundamental" — but the spectrum can: a real C3 has energy at its ODD
+    // harmonics (3f, 5f — i.e. 1.5x and 2.5x the estimate), which a real C4
+    // has none of. Measured: true notes sit at 0.1-2x mean magnitude there;
+    // the mis-read C3 sits at 60-110x. The odd harmonics AND the lower
+    // note's fundamental must all be present, so a single unrelated note
+    // (e.g. a fifth above) can't trigger it.
+    let octaveFixed = 0
+    for (let n = 0; n < 2 && bestMidi - 12 >= cfg.minMidi; n++) {
+      const f = f0Of(bestMidi)
+      // The lower note's own fundamental (f/2) must be present too: a real
+      // weak-fundamental C3 still shows 60-110x mean there (true notes:
+      // 0.4-2x). Without it, a two-note mix that merely has stray energy at
+      // 1.5f/2.5f got pulled down an octave (A2+C3 read as A1, seen on a
+      // real recording).
+      const odd = Math.min(at(0.5 * f), at(1.5 * f), at(2.5 * f))
+      const own = Math.max(at(f), at(2 * f))
+      if (odd > cfg.monoOctaveOddMean * mean && odd > cfg.monoOctaveOddRel * own) {
+        bestMidi -= 12
+        octaveFixed++
+      } else break
+    }
+
+    // Spectral verification of EVERY estimate (strict tier included): a real
+    // pitched note shows several of its first four harmonics well above the
+    // noise level. This is what rejects a dyad's "missing fundamental" — two
+    // notes a few semitones apart (C4 + D#4) beat at their difference
+    // frequency, so the mix repeats at that long period and YIN confidently
+    // reports a phantom pitch ~2.5 octaves below either note (G#1 here, seen
+    // live) — a pitch with no energy at any of its own low harmonics.
+    // Requiring >= 2 of 4 (not the fundamental specifically) still admits
+    // weak-fundamental bass notes. Noise never gets here either (0/400 noise
+    // frames exceeded CMNDF-confidence 0.55).
+    let confident = foundTau > 0
+    if (confident) {
+      const f = f0Of(bestMidi)
+      let present = 0
+      const has = []
+      for (let k = 1; k <= 4; k++) {
+        has[k] = at(k * f) > cfg.monoHarmonicMean * mean
+        if (has[k]) present++
+      }
+      // ...and not ONLY even ones: an octave-BELOW alias of a real note (A1
+      // for a sounding A2) gets all its support from even harmonics — its 2nd
+      // and 4th are exactly the real note's 1st and 2nd — while its own
+      // fundamental and 3rd harmonic are empty. A real pitch has its
+      // fundamental or its 3rd (weak-fundamental bass still has the 3rd).
+      confident = present >= 2 && (has[1] || has[3])
+    }
+    return { midi: bestMidi, confidence: 1 - Math.min(1, bestCmndf), confident, weak, octaveFixed }
   }
 
-  /** Decision + hysteresis for the monophonic path. See `_monoPitch`. */
-  _processMono(frame, rms, onset) {
+  /**
+   * Number of distinct spectral peaks (capped at `cap`) standing well above
+   * the noise level. A note has several harmonics; a dyad has more; broadband
+   * noise essentially never has any (Rayleigh-distributed bin magnitudes top
+   * out around 4-5x the mean, far under monoHarmonicMean x).
+   */
+  _tonalPeaks(rawMagMean, cap) {
+    const thr = this.cfg.monoHarmonicMean * rawMagMean
+    const m = this.mag
+    let n = 0
+    for (let i = 2; i < this.bins - 2 && n < cap; i++) {
+      if (m[i] > thr && m[i] >= m[i - 1] && m[i] >= m[i + 1]) { n++; i += 2 }
+    }
+    return n
+  }
+
+  /**
+   * YIN-first decision for a single expected note, with the comb-scan as a
+   * fallback. YIN never consults the expected-note prior, so it reports what
+   * is actually being played: a wrong low note held for a long time stays a
+   * wrong note, instead of the (very lenient) expected-note threshold
+   * eventually accepting one of that note's own harmonics as "the right
+   * note" — and a note's own octave-below ghost (C3 read as C3+C2) can't
+   * appear, since YIN estimates one fundamental period, not a set of comb
+   * scores.
+   *
+   * YIN alone assumes a monophonic signal; if a second note is also sounding
+   * (an accidental extra key) it can lose lock on the mix. So it doesn't
+   * get to drop the note: on lost confidence it first *coasts* on the last
+   * latched note, and only after `monoFallbackFrames` of sustained
+   * unconfidence does it hand the frame to the comb-scan, which reports the
+   * dyad properly. Pitch changes while latched need `monoSwitchFrames` of
+   * agreement unless a fresh attack (onset) backs them, so period-doubling
+   * flicker during a decay can't bounce the output between octaves.
+   */
+  _processMono(frame, rms, onset, rawMagMean) {
     const cfg = this.cfg
-    const est = this._monoPitch(frame)
+    const est = this._monoPitch(frame, rawMagMean)
     const ms = this.monoState
 
     if (est.confident) {
-      ms.onCount = ms.midi === est.midi ? ms.onCount + 1 : 1
-      ms.midi = est.midi
-      ms.offCount = 0
+      ms.unconfident = 0
+      if (ms.combLive) {
+        // Leaving fallback: drop stale comb-scan hysteresis so a later
+        // fallback starts cold instead of replaying old held notes.
+        for (const s of this.state.values()) { s.on = false; s.onCount = 0; s.offCount = 0 }
+        ms.combLive = false
+      }
+      if (est.midi === ms.midi) {
+        ms.onCount++
+        ms.candMidi = null
+      } else if (ms.midi == null || onset) {
+        ms.midi = est.midi
+        ms.onCount = 1
+        ms.candMidi = null
+      } else {
+        ms.candCount = ms.candMidi === est.midi ? ms.candCount + 1 : 1
+        ms.candMidi = est.midi
+        if (ms.candCount >= cfg.monoSwitchFrames) {
+          ms.midi = est.midi
+          ms.onCount = cfg.monoFramesOn
+          ms.candMidi = null
+        }
+      }
     } else {
-      ms.offCount++
-      if (ms.offCount >= cfg.monoFramesOff) { ms.midi = null; ms.onCount = 0 }
+      ms.unconfident++
+      if (ms.unconfident >= cfg.monoFallbackFrames) {
+        ms.midi = null
+        ms.onCount = 0
+        ms.candMidi = null
+        // Only hand over if the frame actually contains tones. The comb-scan's
+        // expected-note prior is lenient enough to latch the expected note out
+        // of pure noise (measured: 4-41% of noise frames, even with a learned
+        // profile), so without this gate the fallback would report a
+        // "correct" note in a room with nothing being played.
+        if (this._tonalPeaks(rawMagMean, 3) < 3) {
+          if (ms.combLive) {
+            for (const s of this.state.values()) { s.on = false; s.onCount = 0; s.offCount = 0 }
+            ms.combLive = false
+          }
+          return {
+            silent: false, rms, onset, heldMidi: [], held: [],
+            hasNoise: this.hasNoise, debugActive: [],
+          }
+        }
+        ms.combLive = true
+        return this._combScan(rms, onset, rawMagMean)
+      }
     }
 
     const framesOn = onset ? 1 : cfg.monoFramesOn
@@ -565,6 +738,7 @@ export class PitchEngine {
     if (rms < cfg.rmsGate) {
       this._updateNoiseFloor(rms, true)
       for (const s of this.state.values()) { s.on = false; s.onCount = 0; s.offCount = 0 }
+      this.monoState = { midi: null, onCount: 0, unconfident: 0, candMidi: null, candCount: 0, combLive: false }
       this.prevMag.set(this.mag)
       return { silent: true, rms, onset: false, heldMidi: [], held: [], hasNoise: this.hasNoise, debugActive: [] }
     }
@@ -600,12 +774,19 @@ export class PitchEngine {
     this.fluxVar += 0.05 * ((fluxNorm - this.fluxMean) * (fluxNorm - this.fluxMean) - this.fluxVar)
     this.prevFluxNorm = fluxNorm
 
-    // Exactly one expected note -> monophonic YIN path instead of the
-    // spectral harmonic-comb scan (see monoCmndfThreshold comment above).
-    if (this.monoActive) {
-      return this._processMono(frame, rms, onset)
-    }
+    // Exactly one expected note -> YIN-first path (see monoCmndfThreshold
+    // comment above), with the spectral comb-scan as its fallback.
+    if (this.monoActive) return this._processMono(frame, rms, onset, rawMagMean)
+    return this._combScan(rms, onset, rawMagMean)
+  }
 
+  /**
+   * Spectral harmonic-comb scan over every candidate pitch, with the
+   * expected-note prior, ghost suppression, and hysteresis. Handles chords /
+   * free play, and is the monophonic path's fallback when YIN loses lock.
+   */
+  _combScan(rms, onset, rawMagMean) {
+    const cfg = this.cfg
     // Reference level for the absolute SNR gate.
     const noiseFloor = rawMagMean * 0.5 + 1e-9
 

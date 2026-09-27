@@ -250,5 +250,114 @@ for (const m of [48, 60, 72]) {
     JSON.stringify(r.heldMidi) === JSON.stringify([57, 60]), `got [${r.heldMidi}]`)
 }
 
+// ---- YIN-first single-note path (setExpected(..., { mono: true })) ----------
+// Helper: sum of harmonics with explicit per-harmonic gains, fresh buffer.
+function shaped(midis, gains) {
+  const buf = new Float32Array(N)
+  for (const m of midis) {
+    const f0 = midiToFreq(m)
+    gains.forEach((a, i) => {
+      for (let n = 0; n < buf.length; n++) buf[n] += a * Math.sin((2 * Math.PI * (i + 1) * f0 * n) / SR)
+    })
+  }
+  return buf
+}
+
+// 18. A wrong note held for a long time must stay wrong. The comb-scan's
+//     expected-note prior is very lenient, so a low note's 5th harmonic
+//     (G1 -> B3, ≈28 semitones up) eventually gets accepted as "the right
+//     note" — reproduced on a real G1 recording (B3 reported held for the
+//     full 7s). YIN never consults the prior: it reports what is sounding.
+{
+  const e = new PitchEngine(SR)
+  e.setExpected([71], { mono: true }) // B3 expected...
+  let r
+  for (let i = 0; i < 80; i++) r = e.process(shaped([43], [1, 0.8, 0.6, 0.5, 0.4, 0.3])) // ...G1 actually played
+  check('wrong low note held long -> still G1, never "accepted" as expected B3',
+    JSON.stringify(r.heldMidi) === JSON.stringify([43]), `got [${r.heldMidi}]`)
+}
+
+// 19. Octave-up error: a struck string whose fundamental is weaker than its
+//     2nd harmonic is nearly periodic at half the true period, so plain YIN
+//     reads it an octave high (real C3 read correctly for 1.6s, then as C4).
+//     The spectrum disambiguates: real C3 has energy at 3f/5f, a real C4 has
+//     none.
+{
+  const e = new PitchEngine(SR)
+  e.setExpected([60], { mono: true })
+  let r
+  for (let i = 0; i < 12; i++) r = e.process(shaped([60], [0.2, 1, 0.6, 0.5, 0.3, 0.2]))
+  check('C3 with weak fundamental -> C3, not octave-up C4', JSON.stringify(r.heldMidi) === JSON.stringify([60]), `got [${r.heldMidi}]`)
+}
+
+// 20. ...and the correction must not over-fire: a genuine C4 played while C3
+//     is expected is a wrong note and must be reported as C4, not "fixed"
+//     down to the expected C3.
+{
+  const e = new PitchEngine(SR)
+  e.setExpected([60], { mono: true })
+  let r
+  for (let i = 0; i < 12; i++) r = e.process(shaped([72], [1, 0.5, 0.3, 0.2]))
+  check('real C4 while C3 expected -> C4 (no over-correction)', JSON.stringify(r.heldMidi) === JSON.stringify([72]), `got [${r.heldMidi}]`)
+}
+
+// 21. Weak-fundamental bass note (real F0 sits at CMNDF 0.20-0.25, just over
+//     the strict 0.15 gate): the spectrally-verified weak tier must latch it.
+{
+  const e = new PitchEngine(SR)
+  e.setExpected([29], { mono: true })
+  let r
+  for (let i = 0; i < 12; i++) r = e.process(shaped([29], [0.12, 1, 0.9, 0.3, 0.2]))
+  check('weak-fundamental bass note latches', JSON.stringify(r.heldMidi) === JSON.stringify([29]), `got [${r.heldMidi}]`)
+}
+
+// 22. Dyad (accidental extra key): YIN can lose lock on the mix. It must not
+//     drop the note — it coasts, then falls back to the comb-scan.
+{
+  const e = new PitchEngine(SR)
+  e.setExpected([57], { mono: true })
+  let r
+  for (let i = 0; i < 40; i++) r = e.process(shaped([57, 60], [1, 0.7, 0.5, 0.3]))
+  check('mono: expected A2 + extra C3 -> A2 still reported', r.heldMidi.includes(57), `got [${r.heldMidi}]`)
+}
+
+// 22b. A close dyad's "missing fundamental": C4 + D#4 are ~49.5 Hz apart, so
+//      the mix repeats at that long period and unverified YIN confidently
+//      reports a phantom pitch (G#1, seen live — reported for 46 of 48
+//      readings while neither note was G#1). A pitch with no energy at any of
+//      its own low harmonics must be rejected, and the two real notes shown.
+{
+  const e = new PitchEngine(SR)
+  e.setExpected([75], { mono: true }) // D#4 expected
+  let r
+  for (let i = 0; i < 40; i++) r = e.process(shaped([75, 72], [1, 0.8, 0.5, 0.3, 0.15]))
+  check('mono: close dyad -> no phantom missing-fundamental note',
+    r.heldMidi.every((m) => m === 75 || m === 72) && r.heldMidi.includes(75), `got [${r.heldMidi}]`)
+}
+
+// 23. Noise must never latch a pitch. (a) YIN itself is never confident on
+//     broadband noise, weak tier included (400/400 frames in offline
+//     measurement). (b) With a learned noise profile, the whole mono path
+//     — fallback included — reports nothing. (Without any learned profile,
+//     the comb-scan fallback's lenient expected-note prior accepts the
+//     expected note on pure noise — identical to plain comb-scan behavior,
+//     and only reachable when the room never goes quiet enough to learn one.)
+{
+  const e = new PitchEngine(SR)
+  let confident = 0
+  for (let i = 0; i < 100; i++) {
+    e._spectrum(noise(frame(), 0.02))
+    if (e._monoPitch(noise(frame(), 0.02)).confident) confident++
+  }
+  check('YIN never confident on broadband noise', confident === 0, `confident on ${confident}/100 frames`)
+
+  const e2 = new PitchEngine(SR)
+  e2.setExpected([60], { mono: true })
+  for (let i = 0; i < 20; i++) e2.learnNoise(noise(frame(), 0.02))
+  let latched = 0
+  for (let i = 0; i < 100; i++) if (e2.process(noise(frame(), 0.02)).heldMidi.length) latched++
+  check('mono + learned noise profile: noise never latches a pitch', latched === 0, `latched on ${latched}/100 frames`)
+}
+
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail ? 1 : 0)

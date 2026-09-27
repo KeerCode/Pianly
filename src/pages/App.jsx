@@ -272,7 +272,7 @@ function App() {
   useEffect(() => {
     if (mode !== 'practice' || inputMode !== 'mic') return
     const target = noteTimeline[currentNoteIndex]
-    setExpectedRef.current?.(notesToExpectedMidi(target?.notes, anyOctave))
+    setExpectedRef.current?.(notesToExpectedMidi(target?.notes, anyOctave), { mono: target?.notes?.length === 1 })
   }, [mode, inputMode, currentNoteIndex, noteTimeline, anyOctave])
 
   // Check microphone permission
@@ -1105,13 +1105,15 @@ function App() {
           }
         }
         const expected = notesToExpectedMidi(noteTimeline[0]?.notes, anyOctave)
+        // One target note (any-octave expansion included) -> YIN-first detection.
+        const mono = noteTimeline[0]?.notes?.length === 1
         const onDebug = (info) => {
           const now = performance.now()
           if (now - lastMicDebugAtRef.current < 120) return
           lastMicDebugAtRef.current = now
           setMicDebug(info)
         }
-        const { stop, setExpected } = await startPredictiveDetection({ onNotes, expected, onDebug })
+        const { stop, setExpected } = await startPredictiveDetection({ onNotes, expected, mono, onDebug })
         stopMicRef.current = stop
         setExpectedRef.current = setExpected
       } catch (err) {

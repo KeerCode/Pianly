@@ -21,6 +21,7 @@
  * --rate      decode sample rate (default 48000)
  * --hop       analysis hop in ms (default = engine analysisIntervalMs)
  * --set k=v   override a DEFAULT_CONFIG field (repeatable). Numbers are parsed.
+ * --mono      route a single expected note through the YIN-first path
  * --csv       print per-hop "time,held" rows instead of the event summary
  */
 import { execFileSync } from 'node:child_process'
@@ -41,6 +42,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--rate') opts.rate = +argv[++i]
   else if (a === '--hop') opts.hop = +argv[++i]
   else if (a === '--csv') opts.csv = true
+  else if (a === '--mono') opts.mono = true
   else if (a === '--set') { const [k, v] = argv[++i].split('='); opts.set[k] = isNaN(+v) ? v : +v }
   else if (a.startsWith('--')) { console.error('unknown flag', a); process.exit(2) }
   else files.push(a)
@@ -82,7 +84,7 @@ const hop = Math.max(1, Math.round((hopMs / 1000) * SR))
 const engine = new PitchEngine(SR, cfg)
 if (opts.expected) {
   const midis = opts.expected.split(',').map(toMidi).filter((x) => x != null)
-  engine.setExpected(midis)
+  engine.setExpected(midis, { mono: !!opts.mono })
   console.error('expected prior:', midis.map(midiToNoteNamePitch).join(' '))
 }
 

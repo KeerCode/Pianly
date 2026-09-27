@@ -280,7 +280,7 @@ export default function ReadPractice() {
     const tgt = generateTarget(difficultyRef.current)
     targetRef.current = tgt
     setTargetNotes([...tgt.rightNotes, ...tgt.leftNotes].sort((a, b) => a - b))
-    setExpectedRef.current?.([...tgt.rightNotes, ...tgt.leftNotes])
+    setExpectedRef.current?.([...tgt.rightNotes, ...tgt.leftNotes], { mono: tgt.rightNotes.length + tgt.leftNotes.length === 1 })
     renderTarget(tgt)
     reactionStartRef.current = Date.now()
   }, [renderTarget])
@@ -376,6 +376,7 @@ export default function ReadPractice() {
     let stopFn = null
     const tgt = targetRef.current
     const expected = tgt ? [...tgt.rightNotes, ...tgt.leftNotes] : []
+    const mono = tgt ? tgt.rightNotes.length + tgt.leftNotes.length === 1 : false
 
     startPredictiveDetection({
       onNotes: (noteNames) => {
@@ -391,6 +392,7 @@ export default function ReadPractice() {
         checkMatchRef.current?.()
       },
       expected,
+      mono,
       onDebug: (info) => {
         const now = performance.now()
         if (now - lastMicDebugAtRef.current < 120) return
@@ -422,7 +424,7 @@ export default function ReadPractice() {
     heldNotesRef.current.clear()
     setHeldNotes([])
     setTargetNotes([...tgt.rightNotes, ...tgt.leftNotes].sort((a, b) => a - b))
-    setExpectedRef.current?.([...tgt.rightNotes, ...tgt.leftNotes])
+    setExpectedRef.current?.([...tgt.rightNotes, ...tgt.leftNotes], { mono: tgt.rightNotes.length + tgt.leftNotes.length === 1 })
     setStats({ times: [], total: 0, score: 0 })
     setReactionFlash(null)
     setScreen('playing')

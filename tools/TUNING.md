@@ -58,42 +58,83 @@ reaction time in milliseconds — keep it at 8192 or 4096 there.
 
 ---
 
-## Monophonic path (opt-in only — `setExpected(midis, { mono: true })`)
+## Single-note path (YIN-first — `setExpected(midis, { mono: true })`)
 
-When explicitly requested, `process()` skips the spectral harmonic-comb scan
-entirely and uses `_monoPitch()` instead — a YIN-style time-domain pitch
-estimate (cumulative mean normalized difference function, derived from an
-FFT-based autocorrelation in O(maxLag) rather than YIN's usual O(N·maxLag)).
-It estimates the *one* true fundamental period directly, so a note's own
-upper partials can't get mistaken for a second note the spectral comb-scan
-way (a harmonic's own shorter period isn't implied by periodicity at the true
-period).
+The app passes `mono: true` whenever the target is exactly one note (the
+"any octave" expansion of a single note included). `process()` then runs
+`_monoPitch()` — a YIN-style time-domain pitch estimate (cumulative mean
+normalized difference function, derived from an FFT-based autocorrelation in
+O(maxLag)) — instead of trusting the comb-scan's expected-note prior.
 
-**Not used by default, and not wired into the app.** It assumes the real
-signal actually is monophonic — if the player also hits an unexpected extra
-note (easy to do by accident when only one note is expected), YIN's
-single-pitch estimate can lose lock on the resulting two-note dyad entirely,
-and the correctly-played expected note disappears from the output for as
-long as the extra note is held. Verified against a real two-note piano
-recording: expected `[A2]`, actually played A2+C3 — in mono mode A2 vanished
-completely for several seconds despite being continuously played correctly.
-The comb-scan's ghost-suppression fixes (far-below-expected-note harmonics,
-octave-above ghosts — see below) now handle the single-note harmonic-ghost
-case about as well as mono mode did, without that failure mode, so `mono` now
-defaults to `false` unconditionally — pass `{ mono: true }` explicitly only
-if you have a use case where the signal is *guaranteed* monophonic (no
-possibility of an extra note) and want YIN's slightly better bass-note
-precision.
+**Why YIN and not the comb-scan for one note:** YIN never consults the
+expected note, so it reports what is actually sounding. The comb-scan's
+expected-note threshold is deliberately lenient, and a wrong low note's own
+harmonics satisfy it: playing G1 with B3 expected (B3 ≈ G1's 5th harmonic)
+reported B3 as held for the full 7s of a real recording — "hold a wrong note
+long enough and it becomes right". Likewise a note's octave-below ghost
+(C3 read as C3+C2) can't appear, since YIN estimates one fundamental period
+rather than a set of comb scores. Measured on real samples: a wrong `G1` /
+`F1` / `F0` now stays reported as that note for its whole duration.
+
+**Hybrid, not a replacement.** YIN assumes a monophonic signal; with an
+accidental second key it can lose lock on the mix. So it is never allowed to
+*drop* the note: on lost confidence it coasts on the last latched note for
+`monoFallbackFrames`, then hands over to the comb-scan (which reports the dyad
+properly). Known limitation: while YIN *is* confident on one note of a dyad
+it reports only that note, and it can alternate between the two as their
+relative levels drift — an extra key is flagged as a wrong note, but you don't
+get the comb-scan's "expected + extra" pair.
+
+Two corrections that make YIN usable on real piano:
+
+- **Octave-up correction.** A struck string's 2nd harmonic is often louder than
+  its fundamental (and it shifts during the decay), so the signal is nearly
+  periodic at half the true period and YIN reads it an octave high — a real C3
+  read correctly for 1.6s, then as C4 for 2.6s. CMNDF can't tell "C4" from
+  "C3 with a weak fundamental", but the spectrum can: real C3 has energy at
+  its odd harmonics (1.5x and 2.5x the estimate); a real C4 has none.
+  Measured: true notes 0.1–2x the mean bin magnitude there, the mis-read C3
+  60–110x. The odd harmonics *and* the lower note's own fundamental (f/2) must all exceed
+  `monoOctaveOddMean` x mean, and the odd ones `monoOctaveOddRel` x the
+  estimate's own strength — so one unrelated note (a fifth above), or a
+  two-note mix with stray energy, can't trigger it, and a genuine C4 is
+  reported as C4.
+- **Spectral verification of every estimate.** >= 2 of the first 4 harmonics
+  must exceed `monoHarmonicMean` x mean, *and* the fundamental or the 3rd must be
+  one of them. Two failure modes this kills, both seen live/on real audio:
+  a close dyad's phantom "missing fundamental" (C4 + D#4 beat at 49.5 Hz, so
+  the mix repeats at that period and YIN confidently reported G#1 for 46 of 48
+  readings), and an octave-*below* alias of a real note (A1 for a sounding
+  A2, supported only by even harmonics that are really A2's own).
+- **Weak tier.** Bass notes with a weak fundamental shallow the dip
+  (a correct F0 sits at CMNDF 0.20–0.25 for its whole sustain, just over the
+  strict 0.15 gate). The first local minimum under `monoCmndfWeak` is accepted
+  only if >= 2 of the first 4 harmonics exceed `monoHarmonicMean` x the
+  mean magnitude. Pure noise never got past 0.55 confidence in 400 trials.
+
+Measured onset-to-detection latency (real samples, from the *end* of the
+analysis window): 21–46ms for mid/high notes, 121ms F0, 171ms G1 (the lowest
+notes need more periods inside the window) — all inside the 250ms budget.
 
 | knob | default | move to | effect |
 |------|---------|---------|--------|
 | `monoCmndfThreshold` | 0.15 | 0.2–0.25 | more forgiving — if it feels deaf on a quiet/breathy attack |
-| `monoCmndfThreshold` | 0.15 | 0.08–0.12 | stricter — if noise or inharmonicity (very low/high notes, unpitched percussion in the mic) triggers false pitches |
-| `monoFramesOff` | 3 | 5–6 | held note stops dropping out mid-sustain |
+| `monoCmndfThreshold` | 0.15 | 0.08–0.12 | stricter — if noise or inharmonicity triggers false pitches |
+| `monoCmndfWeak` | 0.3 | 0.4 | looser weak-fundamental tier — 0.4 let a spurious D2 through for 0.57s mid-decay on a real F0 recording |
+| `monoHarmonicMean` | 10 | 15–20 | stricter spectral verification of weak-tier notes |
+| `monoOctaveOddMean` / `monoOctaveOddRel` | 12 / 0.02 | raise | less eager to correct an octave-up read down (if a real high note gets pulled down) |
+| `monoSwitchFrames` | 3 | 4–5 | a different pitch must persist this many frames to replace the latched note (a fresh attack switches immediately) — raise if the output still bounces between octaves during decay |
+| `monoFallbackFrames` | 6 | 4 | hand a lost-lock frame to the comb-scan sooner (faster dyad reporting, more expected-prior exposure) |
 
-`npm run analyze` doesn't currently drive this path (it always calls the
-comb-scan tunables) — to test it, call `engine.setExpected([midi], { mono:
-true })` before `engine.process(frame)` in a small script.
+`npm run analyze -- file.wav --expected "C3" --mono` drives this path.
+
+The comb-scan fallback only runs if the frame contains tones (>= 3 spectral
+peaks above `monoHarmonicMean` x the mean magnitude). Without that gate its
+lenient expected-note prior latched the expected note out of pure noise on
+4–41% of frames even with a learned profile, i.e. reported a "correct" note
+with nothing being played. (Plain comb-scan mode — chords / no `mono` — still
+has that leniency when no noise profile has ever been learned, e.g. a room that
+never goes quiet enough to bootstrap one.)
 
 ---
 
