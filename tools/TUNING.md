@@ -123,8 +123,8 @@ notes need more periods inside the window) — all inside the 250ms budget.
 | `monoCmndfWeak` | 0.3 | 0.4 | looser weak-fundamental tier — 0.4 let a spurious D2 through for 0.57s mid-decay on a real F0 recording |
 | `monoHarmonicMean` | 10 | 15–20 | stricter spectral verification of weak-tier notes |
 | `monoOctaveOddMean` / `monoOctaveOddRel` | 12 / 0.02 | raise | less eager to correct an octave-up read down (if a real high note gets pulled down) |
-| `monoSwitchFrames` | 3 | 4–5 | a different pitch must persist this many frames to replace the latched note (a fresh attack switches immediately) — raise if the output still bounces between octaves during decay |
-| `monoFallbackFrames` | 6 | 4 | hand a lost-lock frame to the comb-scan sooner (faster dyad reporting, more expected-prior exposure) |
+| `monoSwitchFrames` | 2 | 3–5 | a different pitch must persist this many frames to replace the latched note (a fresh attack switches immediately) — raise if the output still bounces between octaves during decay |
+| `monoFallbackFrames` | 3 | 2 | hand a lost-lock frame to the comb-scan sooner. 6 (150 ms) made overlapped legato notes take 275-430 ms to register; 3 is clean on every real sample, 2 starts producing blips on C3 |
 
 `npm run analyze -- file.wav --expected "C3" --mono` drives this path.
 
@@ -168,6 +168,43 @@ B3 is exactly E2's 3rd harmonic (3 x 82.4 = 247 Hz, ~2 cents off, far under one
 from "E2 + B3", so this can't be fixed by a threshold — confirmed live: single
 E2 against an E2+B3 target reported both as held. Same family as the octave
 ambiguity (`Octave errors` above), just at a 3:1 ratio.
+
+---
+
+## Advancing on detection (App.jsx, mic only)
+
+MIDI advances on note-off. A mic can't see a key release — the note rings and
+decays for seconds — and waiting for "nothing detected" made every advance
+pause. So for mic input the app advances **the moment the target is matched**,
+and treats whatever was sounding as the *old note* until it clears:
+
+- the old note's pitch classes are ignored against the next target (so its
+  decay/ghosts aren't judged as wrong notes, and a still-ringing note can't
+  falsely match a repeated target);
+- evaluation resumes when the old note stops, when a *new correct-looking note*
+  appears, on a fresh attack (`onNotes(names, { onset })`) of anything new, or
+  on a re-strike of a wanted pitch (repeated notes) — capped at
+  `MIC_RINGOVER_MS` (1500);
+- the 150 ms advance cooldown is skipped for mic: the detector only notifies on
+  *changes*, so a fast next note detected inside the window was dropped.
+
+Measured (synthetic mic into the real app): correct note held -> cursor moves in
+~90-100 ms with no wrong-note hint while it keeps ringing; wrong low note held
+5 s -> never advances, hint shown; then the correct note -> advances in 47-90 ms.
+Offline on **real recordings** with the previous note still ringing and released
+150-300 ms after the new one starts: new note reported in <= 71 ms. Still slow:
+a synthetic *pure-tone* adjacent-semitone legato run (E4 <-> Eb4) took up to
+~350 ms — two exactly-periodic tones 16 Hz apart beat, which is the worst case
+for YIN.
+
+Instant advance made one older bug urgent: an expected note that is a harmonic
+of a real *unexpected* lower note (G1 against an Eb4 target — 6th harmonic)
+latches in 1 frame while the real note needs `framesOnScan` frames, so the
+target read as "played" for the first ~9 frames of every wrong attack. See
+`_explainedByLower`: an expected note is dropped when a spectrally-supported,
+non-expected pitch sits at a harmonic offset below it. A genuine chord has both
+notes expected, so it never fires for one (which is also why a fifth-related
+target like E2+B3 stays ambiguous).
 
 ---
 

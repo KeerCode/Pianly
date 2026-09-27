@@ -88,6 +88,17 @@ function injectSystemBreaksAtTimeSigChange(xmlStr) {
 }
 
 const ADVANCE_COOLDOWN_MS = 150
+// Mic only: after advancing on a match, the note we just matched is still
+// ringing. It's ignored (by pitch class) until it stops, is re-struck, or a new
+// correct-looking note appears; this caps how long evaluation of the next
+// target is held off if none of those is detected.
+const MIC_RINGOVER_MS = 1500
+
+/** Pitch class (0-11) of a note name like "D#4" / "Eb4", or null. */
+function pitchClassOf(name) {
+  const m = noteNameToMidi(name ?? '')
+  return m == null ? null : ((m % 12) + 12) % 12
+}
 const HINT_DELAY_MS = 3000
 const MAX_WRONG_ATTEMPTS = 3
 
@@ -172,7 +183,11 @@ function App() {
   const anyOctaveRef = useRef(false)
   const modeRef = useRef('idle')
   const heldNotesRef = useRef(new Set())
-  const waitingForReleaseRef = useRef(false) // true = correct note played, waiting for release to advance
+  const waitingForReleaseRef = useRef(false) // true = correct note played, waiting for release to advance (MIDI)
+  const inputModeRef = useRef('midi')
+  const staleNotesRef = useRef(new Set())    // mic: pitch classes still ringing from the note we just advanced past
+  const evalBlockedRef = useRef(false)       // mic: hold off judging the next target until the old sound clears
+  const evalBlockTimerRef = useRef(null)
   const wrongCountRef = useRef(0) // counts wrong attempts for current note
   const lastTickSetRef = useRef(-1)
   const autoscrollRef = useRef(true)
@@ -184,6 +199,7 @@ function App() {
   useEffect(() => { pausedRef.current = paused }, [paused])
   useEffect(() => { anyOctaveRef.current = anyOctave }, [anyOctave])
   useEffect(() => { modeRef.current = mode }, [mode])
+  useEffect(() => { inputModeRef.current = inputMode }, [inputMode])
   useEffect(() => { autoscrollRef.current = autoscroll }, [autoscroll])
   useEffect(() => { playbackSpeedRef.current = playbackSpeed }, [playbackSpeed])
   useEffect(() => { localStorage.setItem('nf-input', inputMode) }, [inputMode])
@@ -558,8 +574,15 @@ function App() {
 
   // Advance to the next note, skipping any tied notes
   const doAdvance = useCallback(() => {
-    advanceCooldownRef.current = true
-    setTimeout(() => { advanceCooldownRef.current = false }, ADVANCE_COOLDOWN_MS)
+    // The cooldown guards MIDI against re-triggering on one press. For the mic
+    // it does harm: the detector only re-notifies when the held set changes, so
+    // a fast next note detected inside the window would be dropped and wait
+    // for the following change. The mic's ring-over tracking prevents the
+    // double-advance instead.
+    if (inputModeRef.current !== 'mic') {
+      advanceCooldownRef.current = true
+      setTimeout(() => { advanceCooldownRef.current = false }, ADVANCE_COOLDOWN_MS)
+    }
 
     let nextIdx = currentNoteIndexRef.current + 1
     const tl = noteTimelineRef.current
@@ -612,6 +635,40 @@ function App() {
     })
   }, [])
 
+  // ---- mic ring-over: advance the moment the right note is heard ----------
+  const endRingOverBlock = () => {
+    evalBlockedRef.current = false
+    clearTimeout(evalBlockTimerRef.current)
+    evalBlockTimerRef.current = null
+  }
+  const resetRingOver = () => {
+    staleNotesRef.current = new Set()
+    endRingOverBlock()
+  }
+  // Called for every mic detection with notes present: updates which notes are
+  // still "the old sound" and decides whether the next target can be judged yet.
+  const settleRingOver = (notes, info) => {
+    const stale = staleNotesRef.current
+    if (stale.size === 0 && !evalBlockedRef.current) return
+    const pcs = notes.map(pitchClassOf)
+    const present = new Set(pcs)
+    for (const pc of [...stale]) if (!present.has(pc)) stale.delete(pc) // stopped ringing
+    const target = noteTimelineRef.current[currentNoteIndexRef.current]
+    const targetPcs = new Set((target?.notes ?? []).map(pitchClassOf))
+    // A fresh attack on a note that was ringing AND is wanted now = the same
+    // note played again (repeated notes), so it counts.
+    let restruck = false
+    if (info?.onset) {
+      for (const pc of pcs) {
+        if (stale.has(pc) && targetPcs.has(pc)) { stale.delete(pc); restruck = true }
+      }
+    }
+    // A note that wasn't part of the old sound: a new correct note, or a fresh
+    // attack on anything new (a wrong note should still get feedback promptly).
+    const fresh = pcs.some((pc) => !stale.has(pc) && (targetPcs.has(pc) || info?.onset))
+    if (evalBlockedRef.current && (stale.size === 0 || fresh || restruck)) endRingOverBlock()
+  }
+
   // Called when notes are detected (MIDI noteOn or mic detection)
   const checkNotes = useCallback(() => {
     if (completedRef.current || pausedRef.current) return
@@ -622,9 +679,15 @@ function App() {
     const target = noteTimelineRef.current[idx]
     if (!target) return
 
+    if (evalBlockedRef.current) return
+
     const targetNotes = target.notes
     const anyOct = anyOctaveRef.current
-    const held = [...heldNotesRef.current]
+    const heldAll = [...heldNotesRef.current]
+    // Mic: ignore the still-ringing previous note (by pitch class, so octave
+    // flips / enharmonic spellings of its decay don't count as new notes).
+    const stale = staleNotesRef.current
+    const held = stale.size ? heldAll.filter((h) => !stale.has(pitchClassOf(h))) : heldAll
 
     if (held.length === 0) return
 
@@ -639,12 +702,23 @@ function App() {
     )
 
     if (allTargetsHeld && noExtras) {
-      // Correct — wait for release before advancing
-      waitingForReleaseRef.current = true
       clearTimeout(wrongTimerRef.current)
       wrongTimerRef.current = null
       setShowHint(false)
       wrongCountRef.current = 0
+      if (inputModeRef.current === 'mic') {
+        // A mic can't see a key release — the note just rings and decays for
+        // seconds, and waiting for it made every advance pause. Move on now and
+        // treat whatever is sounding as the old note until it clears.
+        staleNotesRef.current = new Set(heldAll.map(pitchClassOf).filter((pc) => pc != null))
+        evalBlockedRef.current = true
+        clearTimeout(evalBlockTimerRef.current)
+        evalBlockTimerRef.current = setTimeout(endRingOverBlock, MIC_RINGOVER_MS)
+        doAdvance()
+      } else {
+        // MIDI has an exact note-off: wait for it before advancing
+        waitingForReleaseRef.current = true
+      }
     } else if (noExtras && !allTargetsHeld) {
       // User is still building the chord — all held notes are valid targets,
       // just not all of them pressed yet. Don't penalize, just wait.
@@ -665,7 +739,7 @@ function App() {
         }, HINT_DELAY_MS)
       }
     }
-  }, [playTargetHint])
+  }, [playTargetHint, doAdvance])
 
   // Called when all notes are released
   const handleRelease = useCallback(() => {
@@ -738,6 +812,7 @@ function App() {
     setMicDebug(null)
     clearTimeout(wrongTimerRef.current)
     wrongTimerRef.current = null
+    resetRingOver()
     heldNotesRef.current.clear()
     stopToneListenLoop()
     Tone.getTransport().stop()
@@ -1063,6 +1138,7 @@ function App() {
     setShowHint(false)
     setMode('practice')
     lastTickSetRef.current = -1
+    resetRingOver()
 
     if (inputMode === 'midi') {
       if (!selectedDeviceId) {
@@ -1091,16 +1167,18 @@ function App() {
       }
     } else {
       try {
-        const onNotes = (notes) => {
+        const onNotes = (notes, info) => {
           if (notes && notes.length > 0) {
             heldNotesRef.current.clear()
             for (const n of notes) heldNotesRef.current.add(n)
             setDetectedNote(notes.join(' + '))
+            settleRingOver(notes, info)
             checkNotes()
           } else {
-            // All notes released — trigger release logic
+            // Silence — the old note has fully stopped, so everything is fresh again
             heldNotesRef.current.clear()
             setDetectedNote(null)
+            resetRingOver()
             handleRelease()
           }
         }
@@ -1157,16 +1235,19 @@ function App() {
     clearTimeout(wrongTimerRef.current)
     wrongTimerRef.current = null
     lastTickSetRef.current = -1
+    resetRingOver()
   }
 
   // Navigation
   function handlePrevMoment() {
     lastTickSetRef.current = -1
+    resetRingOver()
     setCurrentNoteIndex((i) => Math.max(0, i - 1))
   }
 
   function handleNextMoment() {
     lastTickSetRef.current = -1
+    resetRingOver()
     setCurrentNoteIndex((i) => Math.min(noteTimeline.length - 1, i + 1))
   }
 
@@ -1177,6 +1258,7 @@ function App() {
     const idx = noteTimeline.findIndex((m) => m.measure === target)
     if (idx !== -1) {
       lastTickSetRef.current = -1
+      resetRingOver()
       setCurrentNoteIndex(idx)
     }
   }
@@ -1187,6 +1269,7 @@ function App() {
     const idx = noteTimeline.findIndex((m) => m.measure === target)
     if (idx !== -1) {
       lastTickSetRef.current = -1
+      resetRingOver()
       setCurrentNoteIndex(idx)
     }
   }

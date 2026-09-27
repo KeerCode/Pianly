@@ -37,7 +37,9 @@ const check = (name, cond, detail) => {
 // 1. Single notes across the range (no prior). Below C3 the 8192/48k window
 //    can't resolve a single semitone, so allow a small cluster tolerance.
 for (const m of [28, 40, 52, 60, 69, 76, 88, 100]) {
-  const e = new PitchEngine(SR)
+  // minScanMidi lowered so the bottom-octave free-play note is still in scope;
+  // its default (33) is tested separately below.
+  const e = new PitchEngine(SR, { minScanMidi: 21 })
   const r = detect(e, () => tone(frame(), [m]))
   const tol = m < 48 ? 3 : m < 60 ? 2 : 0
   const hit = r.heldMidi.length >= 1 && r.heldMidi.some((x) => Math.abs(x - m) <= tol)
@@ -360,6 +362,52 @@ function shaped(midis, gains) {
   for (let i = 0; i < 30; i++) r2 = e2.process(tone(frame(), [57, 69]))
   check('without anyOctave, A2+A3 chord still reports both octaves',
     JSON.stringify(r2.heldMidi) === JSON.stringify([57, 69]), `got [${r2.heldMidi}]`)
+}
+
+// 22d. Sub-bass floor: with the default minScanMidi a NON-expected note below
+//      ~55 Hz can't latch (real recordings carry rumble that produced phantom
+//      D0/F#0/C0/A-1 on 20-88% of frames of quiet real notes), but an EXPECTED
+//      note down there still detects.
+{
+  const low = () => shaped([28], [1, 0.8, 0.6, 0.5, 0.3])
+  const a = new PitchEngine(SR)
+  let r
+  for (let i = 0; i < 12; i++) r = a.process(low())
+  check('minScanMidi: unexpected sub-bass note does not latch', !r.heldMidi.includes(28), `got [${r.heldMidi}]`)
+  const b = new PitchEngine(SR)
+  b.setExpected([28])
+  for (let i = 0; i < 12; i++) r = b.process(low())
+  check('minScanMidi: expected sub-bass note still latches', r.heldMidi.includes(28), `got [${r.heldMidi}]`)
+}
+
+// 22e. A wrong low note must not get an expected note accepted as "played".
+//      G1 (43) against a target chord containing Eb4 (75): Eb4 is G1's 6th
+//      harmonic. The expected note latches in 1 frame while G1 needs
+//      framesOnScan of hysteresis, so Eb4 was reported for the first ~9 frames
+//      of the attack — an instant false match once the app advances on
+//      detection instead of waiting for release. Checked per frame from
+//      silence, because the leak is only in the attack.
+{
+  const f0 = 440 * Math.pow(2, (43 - 69) / 12)
+  const sig = new Float32Array(SR * 3)
+  for (let i = Math.round(0.4 * SR); i < sig.length; i++) {
+    const t = i / SR; let v = 0
+    ;[1, 0.8, 0.6, 0.5, 0.4, 0.3].forEach((g, k) => { v += g * Math.sin(2 * Math.PI * f0 * (k + 1) * t) })
+    sig[i] = v * 0.12
+  }
+  const e = new PitchEngine(SR)
+  e.setExpected([75, 72]) // Eb4 + C4, polyphonic
+  const fr = new Float32Array(N); let leaked = 0
+  for (let end = N; end <= sig.length; end += 1200) {
+    fr.set(sig.subarray(end - N, end))
+    if (e.process(fr).heldMidi.includes(75)) leaked++
+  }
+  check('wrong low note G1 never reports its 6th-harmonic target Eb4 as played', leaked === 0, `Eb4 reported on ${leaked} frames`)
+
+  // A genuine Eb4 (no G1) must still be reported.
+  const e2 = new PitchEngine(SR); e2.setExpected([75, 72])
+  let r; for (let i = 0; i < 12; i++) r = e2.process(shaped([75, 72], [1, 0.8, 0.5, 0.3, 0.15]))
+  check('real Eb4 + C4 chord still reported', r.heldMidi.includes(75) && r.heldMidi.includes(72), `got [${r.heldMidi}]`)
 }
 
 // 23. Noise must never latch a pitch. (a) YIN itself is never confident on

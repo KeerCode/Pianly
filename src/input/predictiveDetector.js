@@ -67,6 +67,14 @@ export const DEFAULT_CONFIG = {
                           // partial. Lower to 1 to loosen (helps very weak bass).
   lowHarmonicFrac: 0.12,  // a harmonic counts as present if it exceeds this
                           // fraction of the comb's strongest harmonic.
+  minScanMidi: 33,        // NON-expected candidates below this can't latch (55 Hz,
+                          // the piano's bottom ~1.5 octaves). At this frame size a
+                          // semitone down there is <2 bins wide and real recordings
+                          // carry rumble, so the comb-scan reported phantom D0/F#0/
+                          // C0/A-1 on quiet real notes (20-88% of frames on PP/Mp
+                          // samples). Expected notes are exempt, so a target in the
+                          // bottom octaves still detects; lower it to 21 to also
+                          // flag WRONG notes down there.
   expectedGhostSpanSemitones: 22, // a non-expected candidate this many
                           // semitones (or more) below an EXPECTED note, with
                           // a weak own fundamental, is suppressed outright —
@@ -121,10 +129,10 @@ export const DEFAULT_CONFIG = {
                           // mean magnitude AND this fraction of the estimate's
                           // own strength before the estimate is dropped 12.
   monoFramesOn: 1,        // consecutive confident frames before latching.
-  monoSwitchFrames: 3,    // frames a *different* pitch must persist before it
+  monoSwitchFrames: 2,    // frames a *different* pitch must persist before it
                           // replaces the latched note (a fresh attack switches
                           // immediately) — stops decay-time octave flicker.
-  monoFallbackFrames: 6,  // consecutive frames of YIN having no confident pitch
+  monoFallbackFrames: 3,  // consecutive frames of YIN having no confident pitch
                           // before handing over to the comb-scan (dyads, chords,
                           // noise). Until then the last note is held (coasts).
 
@@ -519,7 +527,7 @@ export class PitchEngine {
   }
 
   /**
-   * Octave-up correction: walk `midi` down (at most two octaves) while the
+   * Octave-up correction: walk `midi` down (one octave) if the
    * spectrum says the note an octave below is the real fundamental.
    *
    * When the fundamental is weaker than the 2nd harmonic (routine for a
@@ -538,7 +546,10 @@ export class PitchEngine {
    */
   _octaveDown(midi, mean) {
     const cfg = this.cfg
-    for (let n = 0; n < 2 && midi - 12 >= cfg.minMidi; n++) {
+    // One octave only: a weak fundamental is the common case; needing the
+    // fundamental AND 2nd harmonic both weak is rare, and allowing a second
+    // step let a quiet real A4 slide down to A2 on sympathetic-resonance energy.
+    for (let n = 0; n < 1 && midi - 12 >= cfg.minMidi; n++) {
       const f = 440 * Math.pow(2, (midi - 69) / 12)
       const at = (hz) => this._magAt(Math.round(hz / this.binHz))
       const odd = Math.min(at(0.5 * f), at(1.5 * f), at(2.5 * f))
@@ -574,6 +585,56 @@ export class PitchEngine {
       }
     }
     return present >= 2 && (h1 || h3)
+  }
+
+  /**
+   * Is non-expected candidate `m` probably just an upper harmonic of an
+   * EXPECTED note? True when it sits 24-42 semitones (roughly the 4th-11th
+   * harmonic) above one AND has no support of its own beyond that one
+   * partial (see _pitchSupported). The upward mirror of the far-below-expected
+   * rule: A2's 5th harmonic is C#5-ish, and a real recording of a single A2
+   * reported C#5/C#6 as an extra note on 6-18% of frames. Only fires for
+   * candidates that would otherwise latch, so it costs nothing per frame.
+   */
+  _isHarmonicOnly(m, mean) {
+    let near = false
+    for (const e of this.expected) {
+      const d = m - e
+      if (d > 24 && d <= 42) { near = true; break }
+    }
+    return near && !this._pitchSupported(m, mean)
+  }
+
+  /**
+   * Is EXPECTED note `e` probably just an upper harmonic of a real lower note
+   * that is NOT expected? True when some non-expected pitch `w` sits at (about)
+   * a harmonic offset below `e` (2nd..10th: 12, 19, 24, 28, 31, 34, 36, 38, 40
+   * semitones, +-1 for low-frequency bin smearing), is above the sub-bass
+   * floor, is spectrally supported as a real pitched note (_pitchSupported),
+   * and has a fundamental that isn't negligible next to `e`'s.
+   *
+   * The expected-note threshold is deliberately lenient, and it latches in one
+   * frame while a non-expected note needs framesOnScan of hysteresis — so a
+   * wrong low note played against a target that happens to be its harmonic
+   * (G1 vs an Eb4 target: 32 semitones up, its 6th harmonic) had the target
+   * reported as "played" for the first ~100 ms of every attack. With advance-
+   * on-detection that was an instant false match. If a real, unexpected lower
+   * note is sounding, the player made a mistake either way (that note is an
+   * extra), so dropping `e` costs nothing and closes the hole. Whether the
+   * lower note is expected is the whole point: a genuine chord (E2 + B3) has
+   * both expected, so this never fires for it.
+   */
+  _explainedByLower(e, mean) {
+    const cfg = this.cfg
+    for (let k = 2; k <= 10; k++) {
+      const off = Math.round(12 * Math.log2(k))
+      for (let d = -1; d <= 1; d++) {
+        const w = e - off + d
+        if (w < cfg.minScanMidi || w >= e || this.expected.has(w)) continue
+        if (this.fund[w] >= 0.2 * this.fund[e] && this._pitchSupported(w, mean)) return true
+      }
+    }
+    return false
   }
 
   /**
@@ -940,7 +1001,9 @@ export class PitchEngine {
       let framesOn = isExp ? cfg.framesOnExpected : cfg.framesOnScan
       if (onset) { tOn *= 0.7; snrOn *= 0.8; framesOn = 1 }
       const tOff = tOn * cfg.tOffRatio
+      // Below minScanMidi only an expected note may latch: see the knob.
       const canOn = rel >= tOn && snr >= snrOn && localMax && aboveNoise && supported
+        && (isExp || (m >= cfg.minScanMidi && !this._isHarmonicOnly(m, rawMagMean)))
 
       if (!st.on) {
         if (canOn) {
@@ -956,6 +1019,15 @@ export class PitchEngine {
         st.offCount = 0
       }
       if (st.on) active.push({ midi: c.midi, rel, snr, isExp })
+    }
+
+    // Drop expected notes that are really a real unexpected lower note's
+    // harmonic (see _explainedByLower). Not in any-octave mode: there every
+    // octave is expected, so the lower "note" is an alternative, not an extra.
+    if (!this.anyOctave) {
+      for (let i = active.length - 1; i >= 0; i--) {
+        if (active[i].isExp && this._explainedByLower(active[i].midi, rawMagMean)) active.splice(i, 1)
+      }
     }
 
     // "Any octave" targets: every octave of a pitch class is expected, which
@@ -980,8 +1052,10 @@ export class PitchEngine {
         // magnitude is small and low-frequency rumble makes 27.5/55 Hz
         // "supported"), then the odd-harmonic check in case salience landed an
         // octave high on a weak-fundamental note.
-        const supported = list.filter((a) => this._pitchSupported(a.midi, rawMagMean))
-        const pool = supported.length ? supported : list
+        const audible = list.filter((a) => a.midi >= cfg.minScanMidi)
+        const cands = audible.length ? audible : list
+        const supported = cands.filter((a) => this._pitchSupported(a.midi, rawMagMean))
+        const pool = supported.length ? supported : cands
         let best = pool.reduce((b, a) => (a.rel > b.rel ? a : b))
         // Sticky: octave is irrelevant to matching in this mode, and on a
         // bass note whose fundamental has faded (F0's sits at 7-19x mean,
@@ -1027,8 +1101,11 @@ export class PitchEngine {
  * Start predictive detection from the microphone.
  *
  * @param {object}   opts
- * @param {(names: string[]|null) => void} opts.onNotes  current held-note names,
- *        or null on silence / all released.
+ * @param {(names: string[]|null, info?: {onset: boolean}) => void} opts.onNotes
+ *        current held-note names, or null on silence / all released. `info.onset`
+ *        is true when this call coincides with a fresh attack (spectral-flux
+ *        onset), which is how a caller can tell a re-struck note from the same
+ *        note still ringing.
  * @param {number[]} [opts.expected]  standard MIDI numbers the score expects now.
  * @param {boolean}  [opts.anyOctave]  `expected` is one note expanded across every
  *   octave (alternatives, not a chord) — see `PitchEngine.setExpected`.
@@ -1122,7 +1199,7 @@ export async function startPredictiveDetection({ onNotes, expected = [], mono, a
       lastSig = sig
       log('held:', held.join(' '), onset ? '(onset)' : '', '| candidates:',
         debugActive.map((a) => `${a.name}${a.expected ? '*' : ''}(rel=${a.rel},snr=${a.snr})`).join(' '))
-      onNotes(held)
+      onNotes(held, { onset })
     }
   }
 
