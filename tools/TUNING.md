@@ -178,17 +178,38 @@ decays for seconds — and waiting for "nothing detected" made every advance
 pause. So for mic input the app advances **the moment the target is matched**,
 and treats whatever was sounding as the *old note* until it clears:
 
-- the old note's pitch classes are ignored against the next target (so its
-  decay/ghosts aren't judged as wrong notes, and a still-ringing note can't
-  falsely match a repeated target);
+- the old note is tracked by **exact pitch** (pitch class only in "Any octave"
+  mode) and ignored against the next target, together with its octave/harmonic
+  *shadows* (12, 24 and 18-20 / 27-41 semitones away — the same offsets the
+  detector's ghost rules use) unless the current target wants that pitch. A
+  first version used pitch class and stalled on every octave-different repeat
+  (C4 -> C3, E3 -> E4: the new note looked like "C4 still ringing"); tracking
+  exact pitch alone let the previous chord's ghosts (E1/F1/A1 under a ringing
+  E2/A3) be judged as wrong notes;
+- a ringing note is only forgotten after it has been absent from the detector
+  for `STALE_GRACE_MS` (600), not after one report without it — the detector
+  often momentarily lists only the newest note, and forgetting it then made the
+  old note look new (and wrong) when it flickered back;
 - evaluation resumes when the old note stops, when a *new correct-looking note*
-  appears, on a fresh attack (`onNotes(names, { onset })`) of anything new, or
-  on a re-strike of a wanted pitch (repeated notes) — capped at
+  appears, on a fresh attack of anything new, or when a wanted stale pitch is
+  re-struck — where "re-struck" means *any attack since the old-sound snapshot*
+  (`RESTRIKE_MARGIN_MS` skips the tail of the note just matched), not one that
+  coincides with the note's first report, because a still-ringing newer note can
+  keep the monophonic estimate busy until the attack is over. Capped at
   `MIC_RINGOVER_MS` (1500);
+- the detector's `onset` to the app is `fluxOnset || attack`, where `attack` is
+  a >1.25x frame-RMS rise within one 25 ms hop (and > 2x rmsGate). Measured on
+  real recordings: 1.4x-3.4x after every re-strike (forte, soft, half-volume, a
+  different note), never > 1.25x during a normal decay. Spectral flux was
+  unreliable in dense playing (its baseline is high);
 - the 150 ms advance cooldown is skipped for mic: the detector only notifies on
   *changes*, so a fast next note detected inside the window was dropped.
 
-Measured (synthetic mic into the real app): correct note held -> cursor moves in
+Measured (real piano recordings played into the real app through a fake mic; the whole
+Fur Elise easy demo, 81 target steps, each note released 320 ms after it starts so
+notes overlap like legato playing): completes with **0 stuck notes**, median 173 ms
+from note start to cursor move, p90 273 ms, 79% of steps within 250 ms. Earlier
+synthetic checks: correct note held -> cursor moves in
 ~90-100 ms with no wrong-note hint while it keeps ringing; wrong low note held
 5 s -> never advances, hint shown; then the correct note -> advances in 47-90 ms.
 Offline on **real recordings** with the previous note still ringing and released
@@ -196,6 +217,14 @@ Offline on **real recordings** with the previous note still ringing and released
 a synthetic *pure-tone* adjacent-semitone legato run (E4 <-> Eb4) took up to
 ~350 ms — two exactly-periodic tones 16 Hz apart beat, which is the worst case
 for YIN.
+
+**Harness warning:** the mic path uses a `ScriptProcessorNode`, which runs on the
+main thread. Polling the page heavily while it runs (e.g. reading `innerText`
+every 8 ms) starves it and drops audio — that produced 'stuck' notes on
+different steps every run that vanished completely when the harness read only
+cheap state. The same applies to the real app: main-thread work (React
+rerenders) can glitch the mic. Moving capture to an `AudioWorklet` would remove
+the dependency.
 
 Instant advance made one older bug urgent: an expected note that is a harmonic
 of a real *unexpected* lower note (G1 against an Eb4 target — 6th harmonic)

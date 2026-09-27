@@ -89,15 +89,37 @@ function injectSystemBreaksAtTimeSigChange(xmlStr) {
 
 const ADVANCE_COOLDOWN_MS = 150
 // Mic only: after advancing on a match, the note we just matched is still
-// ringing. It's ignored (by pitch class) until it stops, is re-struck, or a new
+// ringing. It (and its harmonic/octave shadows) is ignored until it stops, is re-struck, or a new
 // correct-looking note appears; this caps how long evaluation of the next
 // target is held off if none of those is detected.
 const MIC_RINGOVER_MS = 1500
+// A ringing note only counts as gone after it's been absent from the detector this
+// long. A single report without it is a flicker (the detector often momentarily
+// lists only the newest note), and forgetting it then made the note look new —
+// and wrong — when it reappeared a moment later.
+const STALE_GRACE_MS = 600
+// Attacks within this long after an old-sound snapshot don't count as a re-strike
+// (they are the tail of the note that was just matched).
+const RESTRIKE_MARGIN_MS = 60
 
-/** Pitch class (0-11) of a note name like "D#4" / "Eb4", or null. */
-function pitchClassOf(name) {
+// Semitone distances at which a detected note is probably a shadow of a still-
+// ringing one rather than a new note: octaves (12, 24) exactly, and the 3rd..10th
+// harmonic range (19, 28-40, +-1 for low-frequency smear) — the same offsets the
+// detector's own ghost rules use. Seen live: the previous chord's octave/harmonic
+// ghosts (E1, F1, A1 under a ringing E2/A3) were judged as wrong notes.
+const SHADOW_DISTANCES = new Set([12, 24, 18, 19, 20, ...Array.from({ length: 15 }, (_, i) => 27 + i)])
+
+/**
+ * Identity of a note for ring-over tracking: its exact MIDI number, or just the
+ * pitch class in "any octave" mode (where the octave is irrelevant). Exact by
+ * default because the *same letter in another octave is a different note* — an
+ * earlier pitch-class version treated the next note C3 as "C4 still ringing"
+ * and stalled on every octave-different repeat (C4 -> C3, E3 -> E4).
+ */
+function noteKeyOf(name, anyOctave) {
   const m = noteNameToMidi(name ?? '')
-  return m == null ? null : ((m % 12) + 12) % 12
+  if (m == null) return null
+  return anyOctave ? ((m % 12) + 12) % 12 : m
 }
 const HINT_DELAY_MS = 3000
 const MAX_WRONG_ATTEMPTS = 3
@@ -185,8 +207,10 @@ function App() {
   const heldNotesRef = useRef(new Set())
   const waitingForReleaseRef = useRef(false) // true = correct note played, waiting for release to advance (MIDI)
   const inputModeRef = useRef('midi')
-  const staleNotesRef = useRef(new Set())    // mic: pitch classes still ringing from the note we just advanced past
+  const staleNotesRef = useRef(new Map())    // mic: note key -> time it was last missing (null = still heard); the note we just advanced past
   const evalBlockedRef = useRef(false)       // mic: hold off judging the next target until the old sound clears
+  const staleCreatedAtRef = useRef(0)        // mic: when the current old-sound snapshot was taken
+  const lastAttackAtRef = useRef(0)          // mic: time of the most recent fresh attack (onset) from the detector
   const evalBlockTimerRef = useRef(null)
   const wrongCountRef = useRef(0) // counts wrong attempts for current note
   const lastTickSetRef = useRef(-1)
@@ -642,30 +666,56 @@ function App() {
     evalBlockTimerRef.current = null
   }
   const resetRingOver = () => {
-    staleNotesRef.current = new Set()
+    staleNotesRef.current = new Map()
     endRingOverBlock()
+  }
+  // Is this detected note the OLD sound (still ringing, or its shadow) rather
+  // than something the player just did? A note the current target wants always
+  // counts, unless it is exactly the stale note itself (then it needs a re-strike).
+  const isOldSound = (name, targetKeys) => {
+    const stale = staleNotesRef.current
+    if (stale.size === 0) return false
+    const anyOct = anyOctaveRef.current
+    const key = noteKeyOf(name, anyOct)
+    if (key == null) return false
+    if (stale.has(key)) return true
+    if (targetKeys.has(key) || anyOct) return false
+    for (const s of stale.keys()) if (SHADOW_DISTANCES.has(Math.abs(key - s))) return true
+    return false
   }
   // Called for every mic detection with notes present: updates which notes are
   // still "the old sound" and decides whether the next target can be judged yet.
   const settleRingOver = (notes, info) => {
     const stale = staleNotesRef.current
     if (stale.size === 0 && !evalBlockedRef.current) return
-    const pcs = notes.map(pitchClassOf)
-    const present = new Set(pcs)
-    for (const pc of [...stale]) if (!present.has(pc)) stale.delete(pc) // stopped ringing
+    const anyOct = anyOctaveRef.current
+    const keys = notes.map((n) => noteKeyOf(n, anyOct))
+    const present = new Set(keys)
+    const nowPrune = performance.now()
+    for (const [k, goneSince] of [...stale]) {
+      if (present.has(k)) stale.set(k, null)
+      else if (goneSince == null) stale.set(k, nowPrune)              // first report without it: maybe a flicker
+      else if (nowPrune - goneSince > STALE_GRACE_MS) stale.delete(k) // absent long enough: it stopped ringing
+    }
     const target = noteTimelineRef.current[currentNoteIndexRef.current]
-    const targetPcs = new Set((target?.notes ?? []).map(pitchClassOf))
+    const targetKeys = new Set((target?.notes ?? []).map((n) => noteKeyOf(n, anyOct)))
     // A fresh attack on a note that was ringing AND is wanted now = the same
     // note played again (repeated notes), so it counts.
+    // The attack does not have to arrive together with the note's first report:
+    // when the newest note is still ringing the detector may keep listing it
+    // (monophonic estimate) for a while, so the re-struck note only shows up
+    // after its attack is over. Any attack since the snapshot counts (the
+    // margin skips the tail of the note we just matched, whose own attack
+    // frames are still arriving).
     let restruck = false
-    if (info?.onset) {
-      for (const pc of pcs) {
-        if (stale.has(pc) && targetPcs.has(pc)) { stale.delete(pc); restruck = true }
+    if (lastAttackAtRef.current > staleCreatedAtRef.current + RESTRIKE_MARGIN_MS) {
+      for (const k of keys) {
+        if (stale.has(k) && targetKeys.has(k)) { stale.delete(k); restruck = true }
       }
     }
     // A note that wasn't part of the old sound: a new correct note, or a fresh
     // attack on anything new (a wrong note should still get feedback promptly).
-    const fresh = pcs.some((pc) => !stale.has(pc) && (targetPcs.has(pc) || info?.onset))
+    const fresh = notes.some((n, i) => !isOldSound(n, targetKeys) && (targetKeys.has(keys[i]) || info?.onset))
     if (evalBlockedRef.current && (stale.size === 0 || fresh || restruck)) endRingOverBlock()
   }
 
@@ -684,10 +734,10 @@ function App() {
     const targetNotes = target.notes
     const anyOct = anyOctaveRef.current
     const heldAll = [...heldNotesRef.current]
-    // Mic: ignore the still-ringing previous note (by pitch class, so octave
-    // flips / enharmonic spellings of its decay don't count as new notes).
+    // Mic: ignore the still-ringing previous note (see noteKeyOf).
     const stale = staleNotesRef.current
-    const held = stale.size ? heldAll.filter((h) => !stale.has(pitchClassOf(h))) : heldAll
+    const targetKeys = new Set(targetNotes.map((n) => noteKeyOf(n, anyOct)))
+    const held = stale.size ? heldAll.filter((h) => !isOldSound(h, targetKeys)) : heldAll
 
     if (held.length === 0) return
 
@@ -710,7 +760,8 @@ function App() {
         // A mic can't see a key release — the note just rings and decays for
         // seconds, and waiting for it made every advance pause. Move on now and
         // treat whatever is sounding as the old note until it clears.
-        staleNotesRef.current = new Set(heldAll.map(pitchClassOf).filter((pc) => pc != null))
+        staleNotesRef.current = new Map(heldAll.map((h) => noteKeyOf(h, anyOct)).filter((k) => k != null).map((k) => [k, null]))
+        staleCreatedAtRef.current = performance.now()
         evalBlockedRef.current = true
         clearTimeout(evalBlockTimerRef.current)
         evalBlockTimerRef.current = setTimeout(endRingOverBlock, MIC_RINGOVER_MS)
@@ -1172,6 +1223,7 @@ function App() {
             heldNotesRef.current.clear()
             for (const n of notes) heldNotesRef.current.add(n)
             setDetectedNote(notes.join(' + '))
+            if (info?.onset) lastAttackAtRef.current = performance.now()
             settleRingOver(notes, info)
             checkNotes()
           } else {

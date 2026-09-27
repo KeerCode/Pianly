@@ -410,6 +410,27 @@ function shaped(midis, gains) {
   check('real Eb4 + C4 chord still reported', r.heldMidi.includes(75) && r.heldMidi.includes(72), `got [${r.heldMidi}]`)
 }
 
+// 22f. A chord partner must not be vetoed by leakage of its own chord mate.
+//      E2 + B3 (B3 = E2's 3rd harmonic): the "expected note explained by a real
+//      lower note" rule has +-1 semitone slack, which let D#2 — spectral
+//      leakage of the *expected* E2 — count as an independent lower note and
+//      drop B3. Real E2+B3 recording: B3 reported only at 346 ms vs E2 at
+//      46 ms, so a Fur Elise chord step stalled. Both must appear together,
+//      quickly, from silence.
+{
+  const sig = new Float32Array(SR * 2)
+  const add = (m, gains) => { const f0 = midiToFreq(m); for (let i = Math.round(0.4 * SR); i < sig.length; i++) { const t = i / SR; gains.forEach((a, k) => { sig[i] += 0.1 * a * Math.sin(2 * Math.PI * f0 * (k + 1) * t) }) } }
+  add(52, [0.5, 1, 0.8, 0.4, 0.3])   // E2, weak fundamental
+  add(71, [1, 0.5, 0.3])              // B3
+  const e = new PitchEngine(SR); e.setExpected([52, 71])
+  const fr = new Float32Array(N); let both = null
+  for (let end = N; end <= sig.length; end += 1200) {
+    fr.set(sig.subarray(end - N, end)); const r = e.process(fr)
+    if (both == null && r.heldMidi.includes(52) && r.heldMidi.includes(71)) both = Math.round((end / SR - 0.4) * 1000)
+  }
+  check('E2+B3 chord: both notes reported within 150 ms of onset', both != null && both <= 150, `both reported at ${both}ms`)
+}
+
 // 23. Noise must never latch a pitch. (a) YIN itself is never confident on
 //     broadband noise, weak tier included (400/400 frames in offline
 //     measurement). (b) With a learned noise profile, the whole mono path

@@ -631,6 +631,13 @@ export class PitchEngine {
       for (let d = -1; d <= 1; d++) {
         const w = e - off + d
         if (w < cfg.minScanMidi || w >= e || this.expected.has(w)) continue
+        // A pitch within 2 semitones of an expected note is that note's own
+        // spectral leakage / low-frequency smear, not an independent lower note
+        // (the +-1 slack above is what would otherwise let D#2 — leakage of an
+        // expected E2 — "explain" and veto its own chord partner B3).
+        let leak = false
+        for (const x of this.expected) if (Math.abs(w - x) <= 2) { leak = true; break }
+        if (leak) continue
         if (this.fund[w] >= 0.2 * this.fund[e] && this._pitchSupported(w, mean)) return true
       }
     }
@@ -1178,11 +1185,23 @@ export async function startPredictiveDetection({ onNotes, expected = [], mono, a
   let lastSig = null
   let stopped = false
   let lastHasNoise = false
+  let lastRms = 0
 
   const tick = () => {
     if (stopped || samplesIn < FRAME) return
     for (let i = 0; i < FRAME; i++) scratch[i] = ring[(writePos + i) % FRAME]
-    const { silent, rms, heldMidi, held, onset, hasNoise, debugActive } = engine.process(scratch)
+    const { silent, rms, heldMidi, held, onset: fluxOnset, hasNoise, debugActive } = engine.process(scratch)
+    // Energy-based attack: a struck note makes the analysis window's RMS jump
+    // (measured on real recordings: 1.4x-3.4x within one 25 ms hop for every
+    // re-strike — forte, soft, half-volume, or a different note — and never
+    // >1.25x during a normal decay), which flags a repeated pitch that is still
+    // ringing from the previous note. Spectral-flux onset was unreliable there:
+    // during dense playing the flux baseline is high, so real attacks fell
+    // under it. Reported as `onset` to the caller only; the engine's own
+    // thresholds keep using the flux onset.
+    const attack = rms > lastRms * 1.25 && rms > engine.cfg.rmsGate * 2
+    lastRms = rms
+    const onset = fluxOnset || attack
 
     if (hasNoise !== lastHasNoise) {
       lastHasNoise = hasNoise
