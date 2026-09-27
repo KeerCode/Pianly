@@ -272,7 +272,7 @@ function App() {
   useEffect(() => {
     if (mode !== 'practice' || inputMode !== 'mic') return
     const target = noteTimeline[currentNoteIndex]
-    setExpectedRef.current?.(notesToExpectedMidi(target?.notes, anyOctave), { mono: target?.notes?.length === 1 })
+    setExpectedRef.current?.(notesToExpectedMidi(target?.notes, anyOctave), { mono: target?.notes?.length === 1, anyOctave })
   }, [mode, inputMode, currentNoteIndex, noteTimeline, anyOctave])
 
   // Check microphone permission
@@ -1113,7 +1113,7 @@ function App() {
           lastMicDebugAtRef.current = now
           setMicDebug(info)
         }
-        const { stop, setExpected } = await startPredictiveDetection({ onNotes, expected, mono, onDebug })
+        const { stop, setExpected } = await startPredictiveDetection({ onNotes, expected, mono, anyOctave, onDebug })
         stopMicRef.current = stop
         setExpectedRef.current = setExpected
       } catch (err) {

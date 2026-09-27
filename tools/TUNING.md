@@ -138,6 +138,39 @@ never goes quiet enough to bootstrap one.)
 
 ---
 
+## "Any octave" targets (`setExpected(midis, { anyOctave: true })`)
+
+"Any octave" mode expands one target note into every octave of its pitch class.
+Those octaves are alternatives (play *any one*), not a chord that needs them all
+— but the engine can't tell that from the note set (a real A2+A3 chord has the
+identical shape), so the caller says so. Without it, marking every A "expected"
+exempts every octave from ghost suppression and gives all of them the lenient
+expected-note threshold: one played A reported `A-1 + A0 + A2 + A3 + A4` at
+once on a real A2 recording.
+
+With the flag, the comb-scan keeps **one octave per pitch class**: the highest
+comb salience among the spectrally-supported octaves (`_pitchSupported`), then
+the odd-harmonic octave-down check in case salience landed an octave high on a
+weak-fundamental note. The pick is sticky while it stays active and within half
+the best salience, so a bass note whose fundamental has faded (F0) doesn't flap
+between octaves. (A first version picked the *lowest* supported octave; that was
+wrong — late in a decay the frame's mean magnitude is small and low-frequency
+rumble makes 27.5/55 Hz "supported", so it flickered to the bottom of the
+range.) The single-note case goes through YIN, which never had this problem.
+
+Octave is irrelevant to matching in this mode, so an octave flip is cosmetic;
+reporting two octaves at once was the actual bug.
+
+**Known limitation — fifth-related chord targets.** If a target chord contains a
+perfect fifth (E2 + B3), playing just the root also lights up the upper note:
+B3 is exactly E2's 3rd harmonic (3 x 82.4 = 247 Hz, ~2 cents off, far under one
+5.9 Hz bin). Nothing in the spectrum separates "E2 with a strong 3rd harmonic"
+from "E2 + B3", so this can't be fixed by a threshold — confirmed live: single
+E2 against an E2+B3 target reported both as held. Same family as the octave
+ambiguity (`Octave errors` above), just at a 3:1 ratio.
+
+---
+
 ## Missed notes / detector feels deaf
 
 | knob | default | move to | effect |

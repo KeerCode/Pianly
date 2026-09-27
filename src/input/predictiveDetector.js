@@ -304,7 +304,10 @@ export class PitchEngine {
     }
 
     this.expected = new Set()
-    this.monoActive = false  // true when `expected` is a single pitch class (any octave)
+    this.monoActive = false  // single-note target -> YIN-first path
+    this.anyOctave = false   // `expected` is pitch-class alternatives, not a chord
+    this.expectedPcs = new Set()
+    this.groupPick = new Map() // any-octave: pitch class -> last reported octave
     this.state = new Map()   // midi -> { on, onCount, offCount }
     this.monoState = { midi: null, onCount: 0, unconfident: 0, candMidi: null, candCount: 0, combLive: false } // single-note YIN path
     this.fluxMean = 0
@@ -314,7 +317,13 @@ export class PitchEngine {
 
   /**
    * @param {number[]} midis
-   * @param {{mono?: boolean}} [opts]  Whether `midis` represents one musical
+   * @param {{mono?: boolean, anyOctave?: boolean}} [opts]  `anyOctave`: `midis`
+   *   is a note expanded across every octave, i.e. per pitch class the octaves
+   *   are alternatives (play ANY one), not a chord that needs them all. The
+   *   comb-scan then reports at most one octave per pitch class. Can't be
+   *   inferred: a real A2+A3 chord has the identical shape.
+   *
+   *   `mono`: Whether `midis` represents one musical
    *   note (routes to the monophonic YIN path in `process()`) as opposed to a
    *   chord that happens to satisfy this set. This can't be inferred from the
    *   MIDI numbers themselves — e.g. "any octave" mode expands one target
@@ -346,6 +355,8 @@ export class PitchEngine {
       }
     }
     this.monoActive = !!opts.mono
+    this.anyOctave = !!opts.anyOctave
+    this.expectedPcs = new Set([...this.expected].map((m) => m % 12))
   }
 
   reset() {
@@ -496,63 +507,73 @@ export class PitchEngine {
       for (let i = 0; i < this.bins; i++) mean += this.mag[i]
       mean /= this.bins
     }
-    const at = (hz) => this._magAt(Math.round(hz / this.binHz))
-    const f0Of = (m) => 440 * Math.pow(2, (m - 69) / 12)
+    // Weak-fundamental notes make YIN read an octave high — see _octaveDown.
+    const rawMidi = bestMidi
+    bestMidi = this._octaveDown(bestMidi, mean)
+    const octaveFixed = (rawMidi - bestMidi) / 12
 
-    // Octave-up correction. When the fundamental is weaker than the 2nd
-    // harmonic (routine for a struck piano string, and it changes during the
-    // decay: a real C3 read correctly for 1.6s, then as C4 for 2.6s more),
-    // the signal is nearly periodic at half the true period and YIN takes
-    // the shorter lag. CMNDF alone can't tell "C4" from "C3 with a weak
-    // fundamental" — but the spectrum can: a real C3 has energy at its ODD
-    // harmonics (3f, 5f — i.e. 1.5x and 2.5x the estimate), which a real C4
-    // has none of. Measured: true notes sit at 0.1-2x mean magnitude there;
-    // the mis-read C3 sits at 60-110x. The odd harmonics AND the lower
-    // note's fundamental must all be present, so a single unrelated note
-    // (e.g. a fifth above) can't trigger it.
-    let octaveFixed = 0
-    for (let n = 0; n < 2 && bestMidi - 12 >= cfg.minMidi; n++) {
-      const f = f0Of(bestMidi)
-      // The lower note's own fundamental (f/2) must be present too: a real
-      // weak-fundamental C3 still shows 60-110x mean there (true notes:
-      // 0.4-2x). Without it, a two-note mix that merely has stray energy at
-      // 1.5f/2.5f got pulled down an octave (A2+C3 read as A1, seen on a
-      // real recording).
+    // Reject phantom / octave-below-alias pitches — see _pitchSupported.
+    let confident = foundTau > 0
+    if (confident) confident = this._pitchSupported(bestMidi, mean)
+    return { midi: bestMidi, confidence: 1 - Math.min(1, bestCmndf), confident, weak, octaveFixed }
+  }
+
+  /**
+   * Octave-up correction: walk `midi` down (at most two octaves) while the
+   * spectrum says the note an octave below is the real fundamental.
+   *
+   * When the fundamental is weaker than the 2nd harmonic (routine for a
+   * struck piano string, and it changes during the decay: a real C3 read
+   * correctly for 1.6s, then as C4 for 2.6s more), the signal is nearly
+   * periodic at half the true period and YIN takes the shorter lag — and a
+   * salience-based pick can land an octave high for the same reason. CMNDF or
+   * comb score alone can't tell "C4" from "C3 with a weak fundamental" — but
+   * the spectrum can: a real C3 has energy at its ODD harmonics (3f, 5f — 1.5x
+   * and 2.5x the estimate), which a real C4 has none of. Measured: true notes
+   * sit at 0.1-2x mean magnitude there; the mis-read C3 at 60-110x. The odd
+   * harmonics AND the lower note's own fundamental (f/2) must all be present
+   * (a two-note mix with stray energy at 1.5f/2.5f got pulled down an octave
+   * otherwise — A2+C3 read as A1 on a real recording), so a single unrelated
+   * note (e.g. a fifth above) can't trigger it.
+   */
+  _octaveDown(midi, mean) {
+    const cfg = this.cfg
+    for (let n = 0; n < 2 && midi - 12 >= cfg.minMidi; n++) {
+      const f = 440 * Math.pow(2, (midi - 69) / 12)
+      const at = (hz) => this._magAt(Math.round(hz / this.binHz))
       const odd = Math.min(at(0.5 * f), at(1.5 * f), at(2.5 * f))
       const own = Math.max(at(f), at(2 * f))
-      if (odd > cfg.monoOctaveOddMean * mean && odd > cfg.monoOctaveOddRel * own) {
-        bestMidi -= 12
-        octaveFixed++
-      } else break
+      if (odd > cfg.monoOctaveOddMean * mean && odd > cfg.monoOctaveOddRel * own) midi -= 12
+      else break
     }
+    return midi
+  }
 
-    // Spectral verification of EVERY estimate (strict tier included): a real
-    // pitched note shows several of its first four harmonics well above the
-    // noise level. This is what rejects a dyad's "missing fundamental" — two
-    // notes a few semitones apart (C4 + D#4) beat at their difference
-    // frequency, so the mix repeats at that long period and YIN confidently
-    // reports a phantom pitch ~2.5 octaves below either note (G#1 here, seen
-    // live) — a pitch with no energy at any of its own low harmonics.
-    // Requiring >= 2 of 4 (not the fundamental specifically) still admits
-    // weak-fundamental bass notes. Noise never gets here either (0/400 noise
-    // frames exceeded CMNDF-confidence 0.55).
-    let confident = foundTau > 0
-    if (confident) {
-      const f = f0Of(bestMidi)
-      let present = 0
-      const has = []
-      for (let k = 1; k <= 4; k++) {
-        has[k] = at(k * f) > cfg.monoHarmonicMean * mean
-        if (has[k]) present++
+  /**
+   * Does the spectrum actually back `midi` as a pitched note? >= 2 of its
+   * first four harmonics must stand above monoHarmonicMean x the mean bin
+   * magnitude, and one of them must be the fundamental or the 3rd.
+   *
+   * The "not only even harmonics" half is what rejects octave-BELOW aliases:
+   * an alias (A1 for a sounding A2) gets all its support from even harmonics
+   * — its 2nd and 4th are exactly the real note's 1st and 2nd — while its own
+   * fundamental and 3rd harmonic are empty. Weak-fundamental bass still has
+   * its 3rd, so it passes. Also rejects a close dyad's phantom "missing
+   * fundamental" (C4 + D#4 read as G#1 live) — no energy at its own harmonics.
+   */
+  _pitchSupported(midi, mean) {
+    const f = 440 * Math.pow(2, (midi - 69) / 12)
+    let present = 0
+    let h1 = false
+    let h3 = false
+    for (let k = 1; k <= 4; k++) {
+      if (this._magAt(Math.round((k * f) / this.binHz)) > this.cfg.monoHarmonicMean * mean) {
+        present++
+        if (k === 1) h1 = true
+        else if (k === 3) h3 = true
       }
-      // ...and not ONLY even ones: an octave-BELOW alias of a real note (A1
-      // for a sounding A2) gets all its support from even harmonics — its 2nd
-      // and 4th are exactly the real note's 1st and 2nd — while its own
-      // fundamental and 3rd harmonic are empty. A real pitch has its
-      // fundamental or its 3rd (weak-fundamental bass still has the 3rd).
-      confident = present >= 2 && (has[1] || has[3])
     }
-    return { midi: bestMidi, confidence: 1 - Math.min(1, bestCmndf), confident, weak, octaveFixed }
+    return present >= 2 && (h1 || h3)
   }
 
   /**
@@ -739,6 +760,7 @@ export class PitchEngine {
       this._updateNoiseFloor(rms, true)
       for (const s of this.state.values()) { s.on = false; s.onCount = 0; s.offCount = 0 }
       this.monoState = { midi: null, onCount: 0, unconfident: 0, candMidi: null, candCount: 0, combLive: false }
+      this.groupPick.clear()
       this.prevMag.set(this.mag)
       return { silent: true, rms, onset: false, heldMidi: [], held: [], hasNoise: this.hasNoise, debugActive: [] }
     }
@@ -936,6 +958,48 @@ export class PitchEngine {
       if (st.on) active.push({ midi: c.midi, rel, snr, isExp })
     }
 
+    // "Any octave" targets: every octave of a pitch class is expected, which
+    // exempts all of them from ghost suppression and gives all of them the
+    // lenient expected-note threshold — so one played A reported A-1, A0, A2,
+    // A3 and A4 together (seen on a real A2 recording). They're alternatives,
+    // so keep one octave per pitch class: the lowest with real spectral
+    // support (a genuine A2 has energy at its fundamental/3rd; its octave-up
+    // aliases and sub-octave ghosts don't, or are higher than it).
+    if (this.anyOctave && active.length > 1) {
+      const groups = new Map()
+      const keep = []
+      for (const a of active) {
+        const pc = a.midi % 12
+        if (!this.expectedPcs.has(pc)) { keep.push(a); continue }
+        if (!groups.has(pc)) groups.set(pc, [])
+        groups.get(pc).push(a)
+      }
+      for (const list of groups.values()) {
+        // Highest comb salience among the spectrally-supported octaves (raw
+        // "lowest supported" was wrong: late in a decay the frame's mean
+        // magnitude is small and low-frequency rumble makes 27.5/55 Hz
+        // "supported"), then the odd-harmonic check in case salience landed an
+        // octave high on a weak-fundamental note.
+        const supported = list.filter((a) => this._pitchSupported(a.midi, rawMagMean))
+        const pool = supported.length ? supported : list
+        let best = pool.reduce((b, a) => (a.rel > b.rel ? a : b))
+        // Sticky: octave is irrelevant to matching in this mode, and on a
+        // bass note whose fundamental has faded (F0's sits at 7-19x mean,
+        // then lower) salience and the odd-harmonic check can both go either
+        // way frame to frame. Keep last frame's octave while it's still
+        // active and reasonably close, so the display doesn't flap.
+        const pc = best.midi % 12
+        const prev = this.groupPick.get(pc)
+        const held = prev != null && pool.find((a) => a.midi === prev)
+        if (held && held.rel >= 0.5 * best.rel) best = held
+        else best = { ...best, midi: this._octaveDown(best.midi, rawMagMean) }
+        this.groupPick.set(pc, best.midi)
+        keep.push(best)
+      }
+      active.length = 0
+      active.push(...keep)
+    }
+
     active.sort((a, b) => b.rel - a.rel)
     const heldMidi = active.slice(0, cfg.maxPolyphony).map((a) => a.midi).sort((a, b) => a - b)
     // Debug breakdown of every currently-held candidate — why it fired, not just
@@ -966,6 +1030,8 @@ export class PitchEngine {
  * @param {(names: string[]|null) => void} opts.onNotes  current held-note names,
  *        or null on silence / all released.
  * @param {number[]} [opts.expected]  standard MIDI numbers the score expects now.
+ * @param {boolean}  [opts.anyOctave]  `expected` is one note expanded across every
+ *   octave (alternatives, not a chord) — see `PitchEngine.setExpected`.
  * @param {boolean}  [opts.mono]      whether `expected` is one musical note
  *   (see `PitchEngine.setExpected` for why this can't be inferred from the
  *   MIDI numbers alone). Defaults to true only when `expected` has exactly
@@ -981,7 +1047,7 @@ export class PitchEngine {
  *   because rmsGate is miscalibrated for the room).
  * @returns {Promise<{ stop: () => void, setExpected: (midis: number[], opts?: {mono?: boolean}) => void }>}
  */
-export async function startPredictiveDetection({ onNotes, expected = [], mono, config = {}, debug = DEBUG, onDebug = null }) {
+export async function startPredictiveDetection({ onNotes, expected = [], mono, anyOctave, config = {}, debug = DEBUG, onDebug = null }) {
   const log = (...a) => debug && console.log('[Predictive]', ...a)
 
   const stream = await navigator.mediaDevices.getUserMedia({
@@ -1000,7 +1066,7 @@ export async function startPredictiveDetection({ onNotes, expected = [], mono, c
   log('sampleRate:', SR)
 
   const engine = new PitchEngine(SR, config)
-  engine.setExpected(expected, { mono })
+  engine.setExpected(expected, { mono, anyOctave })
   const FRAME = engine.frame
 
   const source = audioCtx.createMediaStreamSource(stream)

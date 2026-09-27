@@ -21,6 +21,7 @@
  * --rate      decode sample rate (default 48000)
  * --hop       analysis hop in ms (default = engine analysisIntervalMs)
  * --set k=v   override a DEFAULT_CONFIG field (repeatable). Numbers are parsed.
+ * --any-octave  expand --expected across every octave (one note, any octave)
  * --mono      route a single expected note through the YIN-first path
  * --csv       print per-hop "time,held" rows instead of the event summary
  */
@@ -43,6 +44,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--hop') opts.hop = +argv[++i]
   else if (a === '--csv') opts.csv = true
   else if (a === '--mono') opts.mono = true
+  else if (a === '--any-octave') opts.anyOctave = true
   else if (a === '--set') { const [k, v] = argv[++i].split('='); opts.set[k] = isNaN(+v) ? v : +v }
   else if (a.startsWith('--')) { console.error('unknown flag', a); process.exit(2) }
   else files.push(a)
@@ -84,7 +86,13 @@ const hop = Math.max(1, Math.round((hopMs / 1000) * SR))
 const engine = new PitchEngine(SR, cfg)
 if (opts.expected) {
   const midis = opts.expected.split(',').map(toMidi).filter((x) => x != null)
-  engine.setExpected(midis, { mono: !!opts.mono })
+  let set = midis
+  if (opts.anyOctave) {
+    const pcs = new Set(midis.map((m) => ((m % 12) + 12) % 12))
+    set = []
+    for (let m = cfg.minMidi; m <= cfg.maxMidi; m++) if (pcs.has(m % 12)) set.push(m)
+  }
+  engine.setExpected(set, { mono: !!opts.mono, anyOctave: !!opts.anyOctave })
   console.error('expected prior:', midis.map(midiToNoteNamePitch).join(' '))
 }
 

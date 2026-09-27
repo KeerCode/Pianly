@@ -335,6 +335,33 @@ function shaped(midis, gains) {
     r.heldMidi.every((m) => m === 75 || m === 72) && r.heldMidi.includes(75), `got [${r.heldMidi}]`)
 }
 
+// 22c. "Any octave" mode marks every octave of the played pitch class as
+//      expected, which exempts all of them from ghost suppression and gives
+//      all of them the lenient expected-note threshold — so ONE played A
+//      reported A-1, A0, A2, A3, A4 together (seen on a real A2 recording).
+//      With `anyOctave: true` the octaves are alternatives: report one.
+{
+  const allA = []
+  for (let m = 21; m <= 108; m++) if (m % 12 === 9) allA.push(m)
+  const e = new PitchEngine(SR)
+  e.setExpected(allA, { anyOctave: true })
+  let r
+  for (let i = 0; i < 30; i++) r = e.process(shaped([57], [0.5, 1, 0.6, 0.4, 0.3, 0.2]))
+  check('any-octave: one played A -> exactly one A reported',
+    r.heldMidi.length === 1 && r.heldMidi[0] % 12 === 9, `got [${r.heldMidi}]`)
+  check('any-octave: correct octave (weak-fundamental A2 not read as A3)',
+    r.heldMidi[0] === 57, `got [${r.heldMidi}]`)
+
+  // Same expected set WITHOUT the flag is a genuine multi-octave chord and
+  // must keep reporting every octave that's actually played.
+  const e2 = new PitchEngine(SR)
+  e2.setExpected([57, 69])
+  let r2
+  for (let i = 0; i < 30; i++) r2 = e2.process(tone(frame(), [57, 69]))
+  check('without anyOctave, A2+A3 chord still reports both octaves',
+    JSON.stringify(r2.heldMidi) === JSON.stringify([57, 69]), `got [${r2.heldMidi}]`)
+}
+
 // 23. Noise must never latch a pitch. (a) YIN itself is never confident on
 //     broadband noise, weak tier included (400/400 frames in offline
 //     measurement). (b) With a learned noise profile, the whole mono path
