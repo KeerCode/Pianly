@@ -11,6 +11,8 @@
     "test:detector": "node tools/engineSmokeTest.mjs",
     "test:calibration": "node tools/calibrationTest.mjs",
     "test:wizard": "node tools/wizardTest.mjs",
+    "test:take": "node tools/takeTest.mjs",
+    "replay": "node tools/replayTake.mjs",
     "analyze": "node tools/analyzeAudio.mjs",
     "tauri": "tauri",
     "tauri:mic": "tauri build --debug --bundles app && codesign --force --sign - --entitlements src-tauri/Entitlements.plist src-tauri/target/debug/bundle/macos/Pianly.app && open src-tauri/target/debug/bundle/macos/Pianly.app"

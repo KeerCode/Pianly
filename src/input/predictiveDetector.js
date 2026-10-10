@@ -28,6 +28,7 @@
  */
 
 import { curveAt, loadActiveCalibration, gateFromRoomRms, midiToHz } from './micCalibration.js'
+import { TakeRecorder, configDiff } from './takeRecorder.js'
 
 const DEBUG = import.meta.env?.DEV ?? false
 
@@ -1341,7 +1342,8 @@ export class PitchEngine {
  *   seeing (e.g. a single played note "held" alongside its harmonics still
  *   clearing the wrong-note threshold, or `hasNoise` never flipping true
  *   because rmsGate is miscalibrated for the room).
- * @returns {Promise<{ stop: () => void, setExpected: (midis: number[], opts?: {mono?: boolean}) => void }>}
+ * @returns {Promise<{ stop: () => void, setExpected: (midis: number[], opts?: {mono?: boolean, anyOctave?: boolean}) => void,
+ *   engine: PitchEngine, captureTake: (context?: object) => object }>}
  */
 export async function startPredictiveDetection({ onNotes, expected = [], mono, anyOctave, config = {}, debug = DEBUG, onDebug = null, calibration, onFrame = null }) {
   const log = (...a) => debug && console.log('[Predictive]', ...a)
@@ -1379,6 +1381,11 @@ export async function startPredictiveDetection({ onNotes, expected = [], mono, a
   log('calibration:', cal ? `${cal.name} (${Object.keys(cal.notes).length} notes${gate != null ? `, rmsGate ${gate}` : ''})` : 'none')
   const FRAME = engine.frame
 
+  // Rolling record of what the engine heard / was told / reported, so a miss
+  // can be saved as a "take" and replayed offline (see takeRecorder.js).
+  const take = new TakeRecorder(SR)
+  take.logExpected(expected, { mono, anyOctave })
+
   const source = audioCtx.createMediaStreamSource(stream)
 
   // Rumble / handling-noise high-pass before anything else.
@@ -1400,6 +1407,7 @@ export async function startPredictiveDetection({ onNotes, expected = [], mono, a
   let samplesIn = 0
   processor.onaudioprocess = (e) => {
     const input = e.inputBuffer.getChannelData(0)
+    take.pushAudio(input)
     for (let i = 0; i < input.length; i++) {
       ring[writePos] = input[i]
       writePos = (writePos + 1) % FRAME
@@ -1429,6 +1437,7 @@ export async function startPredictiveDetection({ onNotes, expected = [], mono, a
     const attack = rms > lastRms * 1.25 && rms > engine.cfg.rmsGate * 2
     lastRms = rms
     const onset = fluxOnset || attack
+    take.logTick({ held: heldMidi, onset, rms })
 
     if (hasNoise !== lastHasNoise) {
       lastHasNoise = hasNoise
@@ -1466,8 +1475,21 @@ export async function startPredictiveDetection({ onNotes, expected = [], mono, a
       audioCtx.close()
       log('stopped')
     },
-    setExpected: (m, opts) => engine.setExpected(m, opts),
+    setExpected: (m, opts) => {
+      take.logExpected(m || [], opts)
+      engine.setExpected(m, opts)
+    },
     engine,
+    /**
+     * Snapshot of the last ~30 s (audio + expected-note timeline + what was
+     * reported + config/calibration) for tools/replayTake.mjs.
+     * @param {object} [context]  small free-form note from the page
+     */
+    captureTake: (context = {}) => take.snapshot({
+      config: configDiff(engine.cfg, DEFAULT_CONFIG),
+      calibration: cal ? { id: cal.id, name: cal.name, roomRms: cal.roomRms, notes: cal.notes } : null,
+      context,
+    }),
   }
 }
 

@@ -12,6 +12,7 @@ import { startPredictiveDetection } from '../input/predictiveDetector'
 import MicSetup from '../MicSetup'
 import { useMicCalibration, calibrationStatus } from '../useMicCalibration'
 import { octavePairLowers } from '../input/micCalibration'
+import { saveTake } from '../input/saveTake'
 import { parseNoteTimelineOSMD } from '../parsers/osmdParser'
 import { tickToSec } from '../parsers/parseTimeline'
 import Background from '../Background'
@@ -180,6 +181,7 @@ function App() {
   const [debugLog, setDebugLog] = useState([])
   const [micDebug, setMicDebug] = useState(null) // live predictive-detector candidate breakdown
   const [showMicSetup, setShowMicSetup] = useState(false)
+  const [takeStatus, setTakeStatus] = useState(null) // result of the last "Save last 30 s"
   const micCal = useMicCalibration()
   // Lower notes of the octave pairs in the loaded piece — the only notes mic
   // calibration changes anything for (see MicSetup `pieceMidis`).
@@ -205,6 +207,7 @@ function App() {
   const stopListenerRef = useRef(null)
   const stopMicRef = useRef(null)
   const setExpectedRef = useRef(null)   // predictive detector's setExpected(midis), while mic practice is running
+  const captureTakeRef = useRef(null)   // predictive detector's captureTake(), same lifetime
   const lastMicDebugAtRef = useRef(0)
   const advanceCooldownRef = useRef(false)
   const wrongTimerRef = useRef(null)
@@ -871,6 +874,7 @@ function App() {
     stopMicRef.current?.()
     stopMicRef.current = null
     setExpectedRef.current = null
+    captureTakeRef.current = null
     setMicDebug(null)
     clearTimeout(wrongTimerRef.current)
     wrongTimerRef.current = null
@@ -1254,9 +1258,10 @@ function App() {
           lastMicDebugAtRef.current = now
           setMicDebug(info)
         }
-        const { stop, setExpected } = await startPredictiveDetection({ onNotes, expected, mono, anyOctave, onDebug })
+        const { stop, setExpected, captureTake } = await startPredictiveDetection({ onNotes, expected, mono, anyOctave, onDebug })
         stopMicRef.current = stop
         setExpectedRef.current = setExpected
+        captureTakeRef.current = captureTake
       } catch (err) {
         const denied = err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError'
         setInputError(
@@ -1266,6 +1271,19 @@ function App() {
         )
         setMode('idle')
       }
+    }
+  }
+
+  // Save the last ~30 s of mic audio + expected notes + what was reported, so a
+  // miss can be replayed offline against this exact piano/mic (tools/replayTake.mjs).
+  async function handleSaveTake() {
+    const capture = captureTakeRef.current
+    if (!capture) { setTakeStatus('Mic is not running.'); return }
+    try {
+      const r = await saveTake(capture({ page: 'sheet', step: currentNoteIndex, steps: noteTimeline.length, anyOctave }))
+      setTakeStatus(r.path ? `Saved to Downloads: ${r.name}` : `Downloaded ${r.name}`)
+    } catch (err) {
+      setTakeStatus(`Could not save: ${err?.message || 'unknown error'}`)
     }
   }
 
@@ -2260,6 +2278,13 @@ function App() {
               <span>rel {a.rel} · snr {a.snr}</span>
             </div>
           ))}
+          <div className="mt-2 pt-2" style={{borderTop:'1px solid var(--panel)'}}>
+            <button onClick={handleSaveTake} className="px-2 py-1 rounded-md cursor-pointer border" style={{borderColor:'var(--border)',color:'var(--ink)'}}
+              title="Save the last 30 s of mic audio, the expected notes and what the detector reported, to replay offline">
+              Save last 30 s
+            </button>
+            {takeStatus && <p className="mt-1 break-all" style={{color:'var(--sub)',opacity:.8}}>{takeStatus}</p>}
+          </div>
         </div>
       )}
 

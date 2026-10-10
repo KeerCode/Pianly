@@ -456,6 +456,46 @@ npm run test:wizard                      # scripted human mistakes through the r
 
 ---
 
+## Capturing a take (tune on your own piano)
+
+Everything in `tools/` is otherwise tested on sampled piano and synthetic
+signals. A *take* closes that gap: in practice, the mic debug panel (bottom
+right, both Sheet Practice and Read Practice) has a **Save last 30 s** button.
+Press it right after a miss or a false advance.
+
+It writes one self-contained JSON file (`pianly-take-YYYYMMDD-HHMMSS.json`,
+~1 MB per 6 s, 16-bit audio) to your Downloads folder (a normal browser download
+outside the desktop app). It contains:
+
+* the audio the engine heard (already through the 30 Hz high-pass — replay does
+  not filter it again),
+* the expected-note timeline (every `setExpected`, with `mono` / `anyOctave`),
+* what the live engine reported each tick, plus config differences from the
+  defaults and the **calibration profile it was running**,
+* a small page context (page, step / difficulty). No score title, no personal
+  data; nothing is stored unless you press the button.
+
+Replay it through the same engine:
+
+```bash
+npm run replay -- take.json                       # per-step table: live vs replay
+npm run replay -- take.json --no-calibration      # same audio, without the profile
+npm run replay -- take.json --set calibK=1.3      # try a knob on YOUR piano
+npm run replay -- take.json --verbose             # every reported change
+npm run replay -- take.json --wav take.wav        # listen to what was recorded
+```
+
+One row per step: when the whole target was first reported in the live run and in
+the replay, and any extra notes. A step that replays differently from live is
+the interesting one (live ticks are jittery, replay is a fixed 25 ms hop, so
+small timing differences are normal; a missed step is not). Put the file next to
+`tools/samples/` and it can be turned into a regression test.
+
+`npm run test:take` covers the ring buffer, event windowing, file format and the
+replay tool (synthetic audio, no samples needed).
+
+---
+
 ## Workflow
 
 ```bash

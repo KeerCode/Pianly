@@ -4,6 +4,7 @@ import { VerovioToolkit } from 'verovio/esm'
 import { enableMidi, listenToDevice, onDevicesChanged } from '../input/midiInput'
 import { startPredictiveDetection } from '../input/predictiveDetector'
 import MicSetup from '../MicSetup'
+import { saveTake } from '../input/saveTake'
 import { useMicCalibration, calibrationStatus } from '../useMicCalibration'
 import { noteNameToMidi } from '../utils/noteConversion'
 import Background from '../Background'
@@ -225,6 +226,7 @@ export default function ReadPractice() {
   const [targetNotes, setTargetNotes]     = useState([])     // flat sorted MIDI int list for display
   const [micDebug, setMicDebug]           = useState(null)   // live predictive-detector candidate breakdown
   const [showMicSetup, setShowMicSetup]     = useState(false)
+  const [takeStatus, setTakeStatus]         = useState(null)   // result of the last "Save last 30 s"
   const micCal = useMicCalibration()
 
   // ── Refs for use inside callbacks / effects ──
@@ -238,6 +240,7 @@ export default function ReadPractice() {
   const advancingRef         = useRef(false)
   const stopMicRef           = useRef(null)
   const setExpectedRef       = useRef(null)   // predictive detector's setExpected(midis), while mic input is active
+  const captureTakeRef       = useRef(null)   // predictive detector's captureTake(), same lifetime
   const lastMicDebugAtRef    = useRef(0)
   const statsRef             = useRef({ times: [], total: 0, score: 0 })
   const advanceRef           = useRef(null)   // forward-ref to advanceTarget
@@ -403,10 +406,11 @@ export default function ReadPractice() {
         lastMicDebugAtRef.current = now
         setMicDebug(info)
       },
-    }).then(({ stop, setExpected }) => {
+    }).then(({ stop, setExpected, captureTake }) => {
       stopFn = stop
       stopMicRef.current = stop
       setExpectedRef.current = setExpected
+      captureTakeRef.current = captureTake
     }).catch((err) => {
       console.error('[ReadPractice] Mic start failed:', err)
     })
@@ -415,10 +419,25 @@ export default function ReadPractice() {
       stopFn?.()
       stopMicRef.current = null
       setExpectedRef.current = null
+      captureTakeRef.current = null
       setMicDebug(null)
       heldNotesRef.current.clear()
     }
   }, [screen, inputMethod])
+
+  // Save the last ~30 s of mic audio + expected notes + what was reported, so a
+  // miss can be replayed offline against this exact piano/mic (tools/replayTake.mjs).
+  const handleSaveTake = useCallback(async () => {
+    const capture = captureTakeRef.current
+    if (!capture) { setTakeStatus('Mic is not running.'); return }
+    try {
+      const tgt = targetRef.current
+      const r = await saveTake(capture({ page: 'read', difficulty, target: tgt ? [...tgt.rightNotes, ...tgt.leftNotes] : [] }))
+      setTakeStatus(r.path ? `Saved to Downloads: ${r.name}` : `Downloaded ${r.name}`)
+    } catch (err) {
+      setTakeStatus(`Could not save: ${err?.message || 'unknown error'}`)
+    }
+  }, [difficulty])
 
   // ── Start game ──
   const startGame = useCallback(() => {
@@ -796,6 +815,17 @@ export default function ReadPractice() {
               <span>rel {a.rel} · snr {a.snr}</span>
             </div>
           ))}
+          <div className="mt-2 pt-2" style={{ borderTop: '1px solid var(--panel)' }}>
+            <button
+              onClick={handleSaveTake}
+              className="px-2 py-1 rounded-md cursor-pointer border"
+              style={{ borderColor: 'var(--border)', color: 'var(--ink)' }}
+              title="Save the last 30 s of mic audio, the expected notes and what the detector reported, to replay offline"
+            >
+              Save last 30 s
+            </button>
+            {takeStatus && <p className="mt-1 break-all" style={{ color: 'var(--sub)', opacity: 0.8 }}>{takeStatus}</p>}
+          </div>
         </div>
       )}
     </div>
