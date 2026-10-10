@@ -2,6 +2,7 @@
 // the engine reports the right notes.
 import { PitchEngine, DEFAULT_CONFIG }
   from '../src/input/predictiveDetector.js'
+import { StrikeRecorder } from '../src/input/micCalibration.js'
 
 const SR = 48000
 const N = DEFAULT_CONFIG.frameSize
@@ -453,6 +454,109 @@ function shaped(midis, gains) {
   let latched = 0
   for (let i = 0; i < 100; i++) if (e2.process(noise(frame(), 0.02)).heldMidi.length) latched++
   check('mono + learned noise profile: noise never latches a pitch', latched === 0, `latched on ${latched}/100 frames`)
+}
+
+
+// 24. Mic calibration (octave-pair resolution). Synthetic piano-like notes with
+//     a note-specific partial profile and per-partial decay. A lone lower note
+//     must not light up its octave; a real octave pair must still be reported;
+//     a calibrated lower note's hidden two-octave-up partner must be found.
+{
+  const HOP = 1200
+  const note = (sig, midi, t0, amps, tau = 1.6) => {
+    const f0 = midiToFreq(midi)
+    const i0 = Math.round(t0 * SR)
+    for (let i = i0; i < sig.length; i++) {
+      const t = (i - i0) / SR
+      const env = Math.min(1, t / 0.008)
+      let v = 0
+      for (let k = 0; k < amps.length; k++) v += amps[k] * Math.exp(-t / (tau / (1 + 0.5 * k))) * Math.sin(2 * Math.PI * (k + 1) * f0 * t)
+      sig[i] += 0.12 * env * v
+    }
+  }
+  const A2 = [1, 0.4, 0.35, 0.2, 0.12, 0.08, 0.05, 0.03]   // weak 2nd partial
+  const A3 = [1, 0.5, 0.3, 0.15, 0.08, 0.04, 0.02, 0.01]
+  const E2 = [0.7, 0.5, 0.4, 0.9, 0.3, 0.2, 0.1, 0.05]     // strong 4th partial
+  const E4 = [1, 0.4, 0.2, 0.1, 0.05, 0.02, 0.01, 0.01]
+  const mk = (secs) => new Float32Array(Math.round(secs * SR))
+  const play = (e, sig, tFrom = 0) => {
+    const seen = []
+    const fr = new Float32Array(N)
+    for (let end = N; end <= sig.length; end += HOP) {
+      fr.set(sig.subarray(end - N, end))
+      const r = e.process(fr)
+      seen.push({ t: end / SR - tFrom, held: new Set(r.heldMidi) })
+    }
+    return seen
+  }
+  const firstAll = (seen, ms, need) => { const f = seen.find((x) => x.t >= 0 && need.every((m) => x.held.has(m))); return f ? Math.round(f.t * 1000) : null }
+  const everAll = (seen, need, t1 = 99) => seen.some((x) => x.t >= 0 && x.t <= t1 && need.every((m) => x.held.has(m)))
+
+  const calibrate = (midi, amps) => {
+    const sig = mk(2.2); note(sig, midi, 0.3, amps)
+    const e = new PitchEngine(SR); e.setExpected([midi], { mono: false }); e.watchAttack(midi)
+    const rec = new StrikeRecorder(midi, { binHz: e.binHz, bins: e.bins })
+    const fr = new Float32Array(N)
+    for (let end = N; end <= sig.length; end += HOP) { fr.set(sig.subarray(end - N, end)); const r = e.process(fr); rec.add(e, e.attackAge(midi), r.rms) }
+    return rec.finish()
+  }
+  const cA2 = calibrate(57, A2), cE2 = calibrate(52, E2)
+  check('calibration: A2 strike recorded', !!cA2.entry, cA2.error)
+  check('calibration: E2 strike recorded', !!cE2.entry, cE2.error)
+  check('calibration: measured f0 within 10 cents', cA2.entry && Math.abs(1200 * Math.log2(cA2.entry.f[0] / midiToFreq(57))) < 10)
+  const wrong = (() => { const sig = mk(2.2); note(sig, 69, 0.3, A3); const e = new PitchEngine(SR); e.setExpected([57], { mono: false }); e.watchAttack(57)
+    const rec = new StrikeRecorder(57, { binHz: e.binHz, bins: e.bins }); const fr = new Float32Array(N)
+    for (let end = N; end <= sig.length; end += HOP) { fr.set(sig.subarray(end - N, end)); const r = e.process(fr); rec.add(e, e.attackAge(57), r.rms) }
+    return rec.finish() })()
+  check('calibration: A3 played for A2 is refused', !wrong.entry, JSON.stringify(wrong.entry && wrong.entry.f))
+
+  if (cA2.entry) {
+    const cal = { notes: { 57: JSON.parse(JSON.stringify(cA2.entry)) } }   // survives a JSON round trip
+    const mkEngine = (c) => { const e = new PitchEngine(SR); e.setExpected([57, 69], { mono: false }); if (c) e.setCalibration(c); return e }
+
+    // lone A2, held 3 s: the pair must never appear
+    const alone = mk(3.4); note(alone, 57, 0.4, A2)
+    const sAlone = play(mkEngine(cal), alone, 0.4)
+    check('calibrated: lone A2 held 3 s never reports A3', !everAll(sAlone, [57, 69]), 'A3 appeared')
+    check('calibrated: lone A2 still reported', sAlone.some((x) => x.held.has(57)))
+    // Baseline for context: what the same stimulus does WITHOUT calibration.
+    console.log(`  info lone A2 without calibration reports the A3 pair: ${everAll(play(mkEngine(null), alone, 0.4), [57, 69]) ? 'yes (the failure calibration fixes)' : 'no'}`)
+
+    // real A2+A3 struck together: both within 250 ms
+    for (const [lag, label] of [[0, 'together'], [0.012, '12 ms apart'], [0.03, '30 ms apart']]) {
+      const both = mk(3.0); note(both, 57, 0.4, A2); note(both, 69, 0.4 + lag, A3)
+      const ms = firstAll(play(mkEngine(cal), both, 0.4), 0, [57, 69])
+      check(`calibrated: A2+A3 struck ${label} -> both within 250 ms`, ms != null && ms <= 250, `at ${ms}ms`)
+    }
+
+    // A3 struck LATE onto a ringing A2 is recognised by its strike (jump rule)
+    const late = mk(4.0); note(late, 57, 0.4, A2); note(late, 69, 1.9, A3)
+    const sLate = play(mkEngine(cal), late, 1.9)
+    check('calibrated: A2 ringing, A3 struck 1.5 s later -> pair within 300 ms of the strike',
+      (() => { const ms = firstAll(sLate, 0, [57, 69]); return ms != null && ms <= 300 })(), `at ${firstAll(sLate, 0, [57, 69])}ms`)
+    check('calibrated: ...and never reported before that strike', !sLate.some((x) => x.t < -0.05 && x.held.has(57) && x.held.has(69)))
+  }
+
+  if (cE2.entry) {
+    // E4 hides under E2's own 4th partial; with the target [E2, E4] it must still be found
+    const cal = { notes: { 52: JSON.parse(JSON.stringify(cE2.entry)) } }
+    const mkEngine = (c) => { const e = new PitchEngine(SR); e.setExpected([52, 64], { mono: false }); if (c) e.setCalibration(c); return e }
+    const both = mk(3.0); note(both, 52, 0.4, E2); note(both, 64, 0.4, E4)
+    const ms = firstAll(play(mkEngine(cal), both, 0.4), 0, [52, 64])
+    check('calibrated: E2+E4 (two octaves, hidden under 4th partial) -> both within 300 ms', ms != null && ms <= 300, `at ${ms}ms`)
+    const alone = mk(3.0); note(alone, 52, 0.4, E2)
+    check('calibrated: lone E2 never reports E4', !everAll(play(mkEngine(cal), alone, 0.4), [52, 64]))
+    const base = firstAll(play(mkEngine(null), both, 0.4), 0, [52, 64])
+    console.log(`  info E2+E4 without calibration: ${base == null ? 'top note never found (the failure calibration fixes)' : 'found at ' + base + 'ms'}`)
+  }
+
+  // No calibration for the lower note -> exactly the old behaviour (no override).
+  {
+    const e = new PitchEngine(SR); e.setExpected([57, 69], { mono: false })
+    e.setCalibration({ notes: { 60: JSON.parse(JSON.stringify(cA2.entry || {})) } }) // some OTHER note's entry
+    const both = mk(2.0); note(both, 57, 0.4, A2); note(both, 69, 0.4, A3)
+    check('uncalibrated lower note: pair still reported (falls through)', everAll(play(e, both, 0.4), [57, 69]))
+  }
 }
 
 console.log(`\n${pass} passed, ${fail} failed`)

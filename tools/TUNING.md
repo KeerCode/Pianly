@@ -346,6 +346,98 @@ speech and mangles musical pitch. This pipeline replaces it.
 
 ---
 
+## Mic calibration (per piano, saved once)
+
+The generic engine cannot tell "A2 alone" from "A2 + A3": A2's own 2nd partial
+lands exactly on A3's fundamental, and how strong that partial is varies a lot
+from note to note (measured on real samples: A2's 2nd partial is 0.03–0.56× its
+fundamental depending on dynamic and time, C3's is ~3×) and over the life of the
+note. A recording of the user's own piano playing that note *alone* pins the
+curve down, so the engine can ask "is this note's partial stronger than it would
+be alone?" instead of "is there energy there?".
+
+**User flow** (`src/MicSetup.jsx`, opened from Settings → Mic Setup in Sheet
+Practice and the "Set up mic" button in Read Practice): measure 2 s of room tone,
+then for each requested note the wizard shows it, listens, and only records the
+strike when it hears *that* pitch with real spectral evidence. A wrong note is
+named ("I heard G3 — play A2") and not recorded; a key lifted too early, too
+quiet, or an octave off is refused with the reason and re-armed. Each captured
+note is written to storage immediately, so quitting midway keeps the progress.
+
+**Persistence.** `localStorage['pianly-mic-calibration']`, one store with any
+number of named piano *profiles* and one active one (`src/input/micCalibration.js`).
+Setup is done once; every later practice session loads the active profile
+automatically (`startPredictiveDetection` reads it unless `calibration` is
+passed). Switching pianos = pick or add another profile and calibrate it;
+"Recalibrate from scratch" clears only the active piano. Corrupt/unavailable
+storage degrades to "not calibrated", never to an error.
+
+**What it changes at runtime** (`PitchEngine._applyCalibration`). Only for a
+target holding a lower note X and its octave/two-octave partner U = X+12/X+24,
+with X calibrated and currently held:
+
+* early in X's life (first `calibEarlySec` = 0.3 s) U is present iff its
+  partial/fundamental ratio exceeds `calibK` × X's recorded alone-ratio at the
+  same age;
+* after that the verdict is **held** and only a decisive new strike (ratio jump
+  *and* a flux/energy onset) turns U on — late in a decay the lone and paired
+  ratios converge across dynamics, so re-judging there is what made a held lone
+  note "become" the pair;
+* anything not covered (no profile, X not calibrated, any-octave mode, X absent)
+  falls through to the unchanged comb-scan result.
+
+The profile also sizes `rmsGate` from the measured room tone
+(`gateFromRoomRms`: 4× room RMS, clamped to 0.003–0.010; default stays 0.005
+without a profile).
+
+**Knobs** (all in `DEFAULT_CONFIG`, prefix `calib`): `calibK` (1.6 — raise if a
+lone lower note still lights the upper, lower if real octaves are missed),
+`calibEarlySec`, `calibOffK` (hysteresis), `calibJumpRatio` /
+`calibStrikeWindowSec` (late strike), `calibMinRatio`, `calibFramesOn/Off`,
+`calibFundMean` / `calibPartialMean` (evidence floors), `calibRestrike*`
+(re-strike clock).
+
+**Measured** (`npm run test:calibration`, real Splendid Grand samples; calibrate
+from one dynamic, test on every dynamic; random relative strike phase, hands at
+mismatched volumes, one in three trials with room noise; 864 trials):
+
+| | uncalibrated | calibrated |
+|---|---|---|
+| lower note alone reported as the pair | 62% | **8%** |
+| pair detected when both are played | 71% | **88%** |
+| median latency to full pair | 96 ms | 96 ms |
+
+By pair (false accept / detected): A1+A2 6% / 61%, A2+A3 19% / 99%, A3+A4 13% /
+91%, A1+A3 0% / 100%, A2+A4 0% / 93%. The two-octave pairs, which the generic
+engine mostly missed (8% / 47% detected), are where it helps most.
+
+**Known limits — read before trusting it.**
+
+* *Bass octaves are the weak spot* (A1+A2 61%). A1's own 2nd partial is about
+  as loud as A2's fundamental, so with a random strike phase the two can
+  cancel; amplitude alone cannot separate them. No threshold fixes this, only
+  more evidence.
+* *Fifth pairs (X and X+19, e.g. E2+B3) are not covered* — their 3rd-partial
+  coincidence beats against the upper note's fundamental, and the ratio crosses
+  over in time (measured). They behave as before.
+* *No interpolation between notes.* Partial ratios differ a lot between
+  neighbouring keys, so an uncalibrated note simply uses the standard detector.
+  Coverage = how many keys were set up (the overview shows which).
+* *One strike per note.* Loud vs soft shifts the ratio by up to ~2×; `calibK`
+  absorbs that. Ask users to play at a normal, comfortable strength — calibrating
+  at the softest dynamic and playing loud was the worst combination tested.
+* Tested offline on one sampled grand piano; real mics, rooms and pedals are
+  not covered by `test:calibration`.
+
+```bash
+npm run test:calibration                 # needs tools/samples (see above) + ffmpeg
+CALIB_K=2.0 npm run test:calibration     # try another calibK
+CALIB_PAIR=A2+A3 CALIB_VERBOSE=1 npm run test:calibration
+npm run test:wizard                      # scripted human mistakes through the real wizard + storage
+```
+
+---
+
 ## Workflow
 
 ```bash

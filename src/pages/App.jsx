@@ -9,6 +9,8 @@ import { noteNameToMidi, getInterval } from '../utils/noteConversion'
 import { getSavedFolder, pickFolder, listScores, loadScore } from '../lib/scoreFolder'
 import { enableMidi, listenToDevice, notesMatch, onDevicesChanged } from '../input/midiInput'
 import { startPredictiveDetection } from '../input/predictiveDetector'
+import MicSetup from '../MicSetup'
+import { useMicCalibration, calibrationStatus } from '../useMicCalibration'
 import { parseNoteTimelineOSMD } from '../parsers/osmdParser'
 import { tickToSec } from '../parsers/parseTimeline'
 import Background from '../Background'
@@ -176,6 +178,8 @@ function App() {
   const [showDebug, setShowDebug] = useState(false)
   const [debugLog, setDebugLog] = useState([])
   const [micDebug, setMicDebug] = useState(null) // live predictive-detector candidate breakdown
+  const [showMicSetup, setShowMicSetup] = useState(false)
+  const micCal = useMicCalibration()
 
   const fileInputRef = useRef(null)
   const svgContainerRef = useRef(null)   // Verovio SVG output container
@@ -1652,6 +1656,26 @@ function App() {
                 </div>
               </div>
 
+              {/* Mic Setup (mic input only) */}
+              {inputMode === 'mic' && (
+                <div>
+                  <p className="text-[10px] uppercase tracking-widest mb-3" style={{color:'var(--sub)'}}>Mic Setup</p>
+                  <div className="flex items-center justify-between gap-3 rounded-xl border p-4" style={{borderColor:'var(--border)',background:'rgba(0,255,200,0.03)'}}>
+                    <div className="min-w-0">
+                      <p className="text-sm truncate" style={{color: micCal.noteCount ? 'var(--ink)' : 'var(--sub)'}}>{calibrationStatus(micCal)}</p>
+                      <p className="text-[10px] mt-1" style={{color:'var(--sub)',opacity:.6}}>Play a few notes once so Pianly learns your piano and mic. Saved on this device; redo it for a different piano.</p>
+                    </div>
+                    <button
+                      onClick={() => setShowMicSetup(true)}
+                      className="px-3 py-1.5 rounded-lg text-xs font-medium border cursor-pointer shrink-0"
+                      style={{borderColor:'var(--accent)',color:'var(--accent)',background:'rgba(0,255,200,0.06)'}}
+                    >
+                      {micCal.noteCount ? 'Manage' : 'Set up mic'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {/* Default Tempo */}
               <div>
                 <p className="text-[10px] uppercase tracking-widest mb-3" style={{color:'var(--sub)'}}>Default Tempo (BPM)</p>
@@ -2128,6 +2152,25 @@ function App() {
                 </div>
               )}
 
+              {inputMode === 'mic' && (
+                <div className="mb-5">
+                  <label className="text-xs uppercase tracking-wider font-medium mb-2 block" style={{color:'var(--sub)'}}>Mic Setup</label>
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-sm min-w-0 truncate" style={{color: micCal.noteCount ? 'var(--ink)' : 'var(--sub)'}}>
+                      {calibrationStatus(micCal)}
+                    </p>
+                    <button
+                      onClick={() => { setShowSettings(false); setShowMicSetup(true) }}
+                      className="px-3 py-1.5 rounded-lg text-xs font-medium border cursor-pointer shrink-0"
+                      style={{borderColor:'var(--accent)',color:'var(--accent)',background:'rgba(0,255,200,0.06)'}}
+                    >
+                      {micCal.noteCount ? 'Manage' : 'Set up mic'}
+                    </button>
+                  </div>
+                  <p className="text-[10px] mt-1.5" style={{color:'var(--sub)',opacity:.5}}>Play a few notes once so Pianly learns your piano and mic. Saved on this device; redo it for a different piano.</p>
+                </div>
+              )}
+
               <p className="text-xs leading-relaxed" style={{color:'var(--sub)',opacity:.5}}>
                 {inputMode === 'midi' ? 'MIDI is supported in Chrome, Edge, and Opera.' : 'Microphone works in all browsers. Grant permission when prompted.'}
               </p>
@@ -2202,7 +2245,7 @@ function App() {
               {micDebug.hasNoise ? 'noise profile learned' : 'no noise profile yet'}
             </span>
           </div>
-          <div className="mb-1.5" style={{color:'var(--sub)',opacity:.7}}>rms {micDebug.rms.toFixed(4)}</div>
+          <div className="mb-1.5" style={{color:'var(--sub)',opacity:.7}}>rms {micDebug.rms.toFixed(4)} · {micDebug.calibration ? `calibrated: ${micDebug.calibration}` : 'not calibrated'}</div>
           {micDebug.active.length === 0 && <p style={{color:'var(--sub)',opacity:.5}}>Nothing held.</p>}
           {micDebug.active.map((a) => (
             <div key={a.midi} className="flex items-center justify-between" style={{color: a.expected ? '#4ade80' : '#f87171'}}>
@@ -2212,6 +2255,8 @@ function App() {
           ))}
         </div>
       )}
+
+      {showMicSetup && <MicSetup onClose={() => setShowMicSetup(false)} />}
 
       {/* Debug panel */}
       {showDebug && (

@@ -27,6 +27,8 @@
  * for live input.
  */
 
+import { curveAt, loadActiveCalibration, gateFromRoomRms, midiToHz } from './micCalibration.js'
+
 const DEBUG = import.meta.env?.DEV ?? false
 
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
@@ -162,6 +164,49 @@ export const DEFAULT_CONFIG = {
   noiseGateRatio: 3.0,    // a note's comb energy must beat the noise profile's
                           // energy on that same comb by this factor.
   highpassHz: 30,         // rumble/HVAC/handling-noise high-pass (below A0).
+
+  // --- calibrated octave-pair resolution (needs a mic calibration profile) ---
+  // Only active for targets holding a note X and X+12 (or X+24) when X was
+  // calibrated: U = X+12k is judged present iff its energy exceeds what X's
+  // own partial n=2^k would give ALONE, per the user's recorded decay curve.
+  // See PitchEngine._applyCalibration and tools/TUNING.md.
+  calibK: 1.6,            // early window: present iff observed partial ratio
+                          // > calibK * the calibrated alone-ratio at the
+                          // note's age. Absorbs the ~2x loud-vs-soft swing a
+                          // single strike can't capture. Raise if a lone lower
+                          // note still lights the upper one; lower if real
+                          // octaves are missed.
+  calibEarlySec: 0.3,     // the curve is only decisive this early in the note;
+                          // later, alone and pair ratios converge (measured,
+                          // across dynamics: a softer note's alone-ratio sits
+                          // 4x above a loud calibration's curve by ~1 s) so
+                          // the verdict is HELD instead of re-judged, and only
+                          // a decisive new strike (below) changes it. This is
+                          // what stops "hold a lone note long enough and the
+                          // pair appears".
+  calibJumpRatio: 1.6,    // ...and a fresh strike of the upper note onto an
+                          // already-ringing lower one is recognised by the
+                          // ratio jumping by this factor above the lowest of
+                          // the last few frames.
+  calibStrikeWindowSec: 0.25, // a late ratio jump only counts within this long
+                          // of a detected attack (beat modulation of a ringing
+                          // note can fake a jump but never an onset).
+  calibOffK: 1.25,        // early window only: once latched, release when the
+                          // ratio falls under calibOffK * the alone-ratio.
+  calibMinRatio: 0.12,    // never accept below this ratio at any age: the
+                          // calibrated curve gets tiny late in a decay and
+                          // would otherwise let measurement noise through.
+  calibFramesOn: 2,       // consecutive frames of "present" before latching
+  calibFramesOff: 2,      // ... and of "absent" before releasing.
+  calibFundMean: 4,       // the lower note's own fundamental must exceed this
+                          // multiple of the frame mean magnitude to be judged.
+  calibPartialMean: 3,    // the upper note's partial must exceed this multiple.
+  calibRestrikeRatio: 1.35, // a calibrated note's fundamental amplitude jumping
+                          // by this factor frame-to-frame marks a (re)strike...
+  calibRestrikeOnsetSec: 0.075, // ...and only if a flux/energy onset fired this
+                          // close to it (beats alone never fire one).
+  calibRestrikeGapSec: 0.25, // ...at most once per this long (the window fill
+                          // ramps over several frames; not several strikes).
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +366,37 @@ export class PitchEngine {
     this.fluxMean = 0
     this.fluxVar = 1
     this.prevFluxNorm = 0
+
+    // Mic calibration (see setCalibration / _applyCalibration).
+    this.calib = null            // { notes: { [midi]: entry } } | null
+    this.clock = 0               // seconds; process()'s tSec, or a frame counter
+    this.autoClock = 0
+    this.lastRawMagMean = 0
+    this.lastOnsetAt = -Infinity // clock of the last spectral-flux / energy attack
+    this.prevRms = 0
+    this.watch = new Set()       // midis whose attack age is tracked
+    this.attackState = new Map() // midi -> { last, at }
+    this.calibState = new Map()  // upper midi -> { on, count }
+  }
+
+  /**
+   * Install (or clear, with null) a mic calibration — see micCalibration.js.
+   * Without one the engine behaves exactly as before.
+   */
+  setCalibration(cal) {
+    this.calib = cal && cal.notes && Object.keys(cal.notes).length ? cal : null
+    this.calibState.clear()
+    this.attackState.clear()
+  }
+
+  /** Track attack age for `midi` even without a calibration entry (setup wizard). */
+  watchAttack(midi) { this.watch.add(midi) }
+  unwatchAttack(midi) { this.watch.delete(midi); this.attackState.delete(midi) }
+
+  /** Seconds since `midi`'s last detected strike, or null if none seen. */
+  attackAge(midi) {
+    const a = this.attackState.get(midi)
+    return a && a.at != null ? this.clock - a.at : null
   }
 
   /**
@@ -368,6 +444,8 @@ export class PitchEngine {
   }
 
   reset() {
+    this.attackState.clear()
+    this.calibState.clear()
     this.state.clear()
     this.monoState = { midi: null, onCount: 0, unconfident: 0, candMidi: null, candCount: 0, combLive: false }
     this.prevMag.fill(0)
@@ -794,6 +872,119 @@ export class PitchEngine {
     }
   }
 
+  /** Amplitude near `hz` (max of +-1 bin, on the noise-subtracted spectrum). */
+  _ampAtHz(hz) {
+    const b = Math.round(hz / this.binHz)
+    if (b < 2 || b >= this.bins - 1) return 0
+    return this._magAt(b)
+  }
+
+  /**
+   * Strike clock for every calibrated / watched note. A note's fundamental
+   * amplitude jumping by `calibRestrikeRatio` frame-to-frame (and clearing the
+   * noise) is an attack; consecutive rising frames within `calibRestrikeGapSec`
+   * are the same strike, not new ones. Live detection and the setup wizard use
+   * this one definition of "age", so a recorded curve is read at the same ages
+   * it was captured at.
+   */
+  _trackAttacks(rawMagMean) {
+    if (!this.calib && this.watch.size === 0) return
+    const cfg = this.cfg
+    const seen = this.calib ? Object.keys(this.calib.notes) : []
+    const check = (m, f1) => {
+      const a = this._ampAtHz(f1)
+      const st = this.attackState.get(m) || { last: 0, at: null }
+      // A real strike moves the whole frame's energy/flux; beating between a
+      // ringing note's unison strings changes one bin's amplitude by as much
+      // but never fires an onset, so require both.
+      const rising = a > cfg.calibRestrikeRatio * st.last && a > cfg.calibFundMean * rawMagMean
+        && this.clock - this.lastOnsetAt <= cfg.calibRestrikeOnsetSec
+      if (rising && (st.at == null || this.clock - st.at > cfg.calibRestrikeGapSec)) st.at = this.clock
+      st.last = a
+      this.attackState.set(m, st)
+    }
+    for (const k of seen) {
+      const e = this.calib.notes[k]
+      check(+k, e.f?.[0] ?? midiToHz(+k))
+    }
+    for (const m of this.watch) if (!this.calib?.notes[m]) check(m, midiToHz(m))
+  }
+
+  /**
+   * Calibrated octave-pair resolution. For an EXPECTED upper note U = X + 12k
+   * whose lower partner X is also expected, currently held, and calibrated,
+   * decide "is U really being played?" from the one number a generic model
+   * can't know — how strong X's own partial n = 2^k is when X sounds ALONE
+   * (the user's recorded curve, read at X's age) — instead of from comb
+   * salience, which can't tell X's harmonic from a second note.
+   *
+   * It overrides both failures of the generic path: a lone X lighting up U
+   * (false accept), and a real U hidden under X's harmonic (missed top note).
+   * Anything not covered (no calibration, X not calibrated/held, any-octave
+   * mode) falls through to the comb-scan result untouched.
+   */
+  _applyCalibration(active, rawMagMean, sal, maxSal) {
+    if (!this.calib || this.anyOctave) return
+    const cfg = this.cfg
+    const notes = this.calib.notes
+    const present = new Set(active.map((a) => a.midi))
+    const drop = new Set()
+    const add = []
+    const targets = [...this.expected].sort((a, b) => a - b)
+    for (const U of targets) {
+      const st = this.calibState.get(U)
+      let verdict = null // true/false, or null = not decidable here
+      let rho = null
+      for (let k = 1; k <= 2 && verdict === null; k++) {
+        const X = U - 12 * k
+        if (!this.expected.has(X) || !notes[X]) continue
+        // X must itself be (still) judged present: earlier iterations may have
+        // dropped it (chain A1 -> A2 -> A3).
+        if (!present.has(X)) continue
+        const e = notes[X]
+        const n = 2 ** k
+        const age = this.attackAge(X)
+        const curve = e.r?.[n]
+        if (age == null || !curve || e.f?.[0] == null || e.f?.[n - 1] == null) continue
+        const a1 = this._ampAtHz(e.f[0])
+        if (a1 < cfg.calibFundMean * rawMagMean) continue
+        const an = this._ampAtHz(e.f[n - 1])
+        rho = an / a1
+        const loud = an > cfg.calibPartialMean * rawMagMean
+        const ref = st?.hist?.length ? Math.min(...st.hist) : rho
+        if (age <= cfg.calibEarlySec) {
+          const c = curveAt(e.ages, curve, age)
+          const thr = Math.max((st?.on ? cfg.calibOffK : cfg.calibK) * c, cfg.calibMinRatio)
+          verdict = loud && rho > thr
+        } else if (st?.on) {
+          verdict = true // hold: see calibEarlySec
+        } else {
+          // Beats between a note's unison strings modulate its amplitude by
+          // enough to fake a ratio jump, so a jump only counts right after a
+          // real strike (flux/energy attack) somewhere in the window.
+          const struck = this.clock - this.lastOnsetAt <= cfg.calibStrikeWindowSec
+          verdict = loud && struck && rho > cfg.calibJumpRatio * ref
+        }
+      }
+      if (verdict === null) { this.calibState.delete(U); continue }
+      const cs = st || { on: false, count: 0, hist: [] }
+      if (verdict === cs.on) cs.count = 0
+      else if (++cs.count >= (verdict ? cfg.calibFramesOn : cfg.calibFramesOff)) { cs.on = verdict; cs.count = 0 }
+      if (rho != null) { cs.hist.push(rho); if (cs.hist.length > 4) cs.hist.shift() }
+      this.calibState.set(U, cs)
+      if (cs.on && !present.has(U)) {
+        add.push({ midi: U, rel: Math.min(1, sal[U] / maxSal) || 0.5, snr: 0, isExp: true, calibrated: true })
+        present.add(U)
+      } else if (!cs.on && present.has(U)) {
+        drop.add(U)
+        present.delete(U)
+      }
+    }
+    if (drop.size === 0 && add.length === 0) return
+    for (let i = active.length - 1; i >= 0; i--) if (drop.has(active[i].midi)) active.splice(i, 1)
+    for (const a of add) active.push(a)
+  }
+
   _magAt(b) {
     const m = this.mag
     let v = m[b]
@@ -807,8 +998,9 @@ export class PitchEngine {
    * @param {Float32Array} frame  length === cfg.frameSize
    * @returns {{silent:boolean, rms:number, onset:boolean, heldMidi:number[], held:string[]}}
    */
-  process(frame) {
+  process(frame, tSec) {
     const cfg = this.cfg
+    this.clock = tSec != null ? tSec : (this.autoClock += cfg.analysisIntervalMs / 1000)
     let rms = 0
     for (let i = 0; i < this.frame; i++) rms += frame[i] * frame[i]
     rms = Math.sqrt(rms / this.frame)
@@ -820,6 +1012,7 @@ export class PitchEngine {
     let rawMagMean = 0
     for (let i = 0; i < this.bins; i++) rawMagMean += this.mag[i]
     rawMagMean /= this.bins
+    this.lastRawMagMean = rawMagMean
 
     // Silence: release everything. Noise-floor tracking below still runs
     // (it's not gated on this) — a genuinely quiet frame just lets it fall
@@ -829,6 +1022,9 @@ export class PitchEngine {
       for (const s of this.state.values()) { s.on = false; s.onCount = 0; s.offCount = 0 }
       this.monoState = { midi: null, onCount: 0, unconfident: 0, candMidi: null, candCount: 0, combLive: false }
       this.groupPick.clear()
+      this.attackState.clear()
+      this.calibState.clear()
+      this.prevRms = rms
       this.prevMag.set(this.mag)
       return { silent: true, rms, onset: false, heldMidi: [], held: [], hasNoise: this.hasNoise, debugActive: [] }
     }
@@ -863,6 +1059,11 @@ export class PitchEngine {
     this.fluxMean += 0.05 * (fluxNorm - this.fluxMean)
     this.fluxVar += 0.05 * ((fluxNorm - this.fluxMean) * (fluxNorm - this.fluxMean) - this.fluxVar)
     this.prevFluxNorm = fluxNorm
+    // A strike of any key, by spectral flux OR a frame-energy rise (flux alone
+    // misses real attacks in dense playing; same rule the live loop reports).
+    if (onset || (rms > this.prevRms * 1.25 && rms > cfg.rmsGate * 2)) this.lastOnsetAt = this.clock
+    this.prevRms = rms
+    this._trackAttacks(rawMagMean)
 
     // Exactly one expected note -> YIN-first path (see monoCmndfThreshold
     // comment above), with the spectral comb-scan as its fallback.
@@ -1037,6 +1238,9 @@ export class PitchEngine {
       }
     }
 
+    // Calibrated octave pairs (no-op without a mic calibration).
+    this._applyCalibration(active, rawMagMean, sal, maxSal)
+
     // "Any octave" targets: every octave of a pitch class is expected, which
     // exempts all of them from ghost suppression and gives all of them the
     // lenient expected-note threshold — so one played A reported A-1, A0, A2,
@@ -1121,6 +1325,14 @@ export class PitchEngine {
  *   MIDI numbers alone). Defaults to true only when `expected` has exactly
  *   one value.
  * @param {object}   [opts.config]    partial DEFAULT_CONFIG override.
+ * @param {object|null} [opts.calibration]  engine calibration (see
+ *   micCalibration.toEngineCalibration). Omitted -> the active saved profile is
+ *   loaded from storage; pass null to run uncalibrated (the setup wizard does).
+ * @param {(f: {engine: PitchEngine, t: number, rms: number, silent: boolean,
+ *   heldMidi: number[], held: string[], onset: boolean,
+ *   active: {midi:number,name:string,rel:number,snr:number,expected:boolean}[]}) => void} [opts.onFrame]
+ *   fires every analysis tick after process(); the setup wizard records strikes
+ *   from it.
  * @param {boolean}  [opts.debug]
  * @param {(info: {rms:number, hasNoise:boolean, onset:boolean,
  *   active:{midi:number,name:string,rel:number,snr:number,expected:boolean}[]}) => void}
@@ -1131,7 +1343,7 @@ export class PitchEngine {
  *   because rmsGate is miscalibrated for the room).
  * @returns {Promise<{ stop: () => void, setExpected: (midis: number[], opts?: {mono?: boolean}) => void }>}
  */
-export async function startPredictiveDetection({ onNotes, expected = [], mono, anyOctave, config = {}, debug = DEBUG, onDebug = null }) {
+export async function startPredictiveDetection({ onNotes, expected = [], mono, anyOctave, config = {}, debug = DEBUG, onDebug = null, calibration, onFrame = null }) {
   const log = (...a) => debug && console.log('[Predictive]', ...a)
 
   const stream = await navigator.mediaDevices.getUserMedia({
@@ -1149,8 +1361,22 @@ export async function startPredictiveDetection({ onNotes, expected = [], mono, a
   const SR = audioCtx.sampleRate
   log('sampleRate:', SR)
 
-  const engine = new PitchEngine(SR, config)
+  // Calibration profile (saved once from the setup wizard): the octave-pair
+  // check, plus an rmsGate sized to the room tone measured at setup.
+  let cal = null
+  if (calibration === undefined) {
+    try { cal = loadActiveCalibration() } catch { cal = null }
+  } else {
+    cal = calibration
+  }
+  const cfgIn = { ...config }
+  const gate = cal ? gateFromRoomRms(cal.roomRms) : null
+  if (gate != null && cfgIn.rmsGate == null) cfgIn.rmsGate = gate
+
+  const engine = new PitchEngine(SR, cfgIn)
   engine.setExpected(expected, { mono, anyOctave })
+  if (cal) engine.setCalibration(cal)
+  log('calibration:', cal ? `${cal.name} (${Object.keys(cal.notes).length} notes${gate != null ? `, rmsGate ${gate}` : ''})` : 'none')
   const FRAME = engine.frame
 
   const source = audioCtx.createMediaStreamSource(stream)
@@ -1190,7 +1416,8 @@ export async function startPredictiveDetection({ onNotes, expected = [], mono, a
   const tick = () => {
     if (stopped || samplesIn < FRAME) return
     for (let i = 0; i < FRAME; i++) scratch[i] = ring[(writePos + i) % FRAME]
-    const { silent, rms, heldMidi, held, onset: fluxOnset, hasNoise, debugActive } = engine.process(scratch)
+    const tNow = performance.now() / 1000
+    const { silent, rms, heldMidi, held, onset: fluxOnset, hasNoise, debugActive } = engine.process(scratch, tNow)
     // Energy-based attack: a struck note makes the analysis window's RMS jump
     // (measured on real recordings: 1.4x-3.4x within one 25 ms hop for every
     // re-strike — forte, soft, half-volume, or a different note — and never
@@ -1207,7 +1434,8 @@ export async function startPredictiveDetection({ onNotes, expected = [], mono, a
       lastHasNoise = hasNoise
       log(hasNoise ? 'noise profile learned — subtraction active' : 'noise profile lost (reset)')
     }
-    onDebug?.({ rms, hasNoise, onset, active: debugActive ?? [] })
+    onDebug?.({ rms, hasNoise, onset, active: debugActive ?? [], calibration: cal ? `${cal.name} (${Object.keys(cal.notes).length})` : null })
+    onFrame?.({ engine, t: tNow, rms, silent, heldMidi, held, onset, active: debugActive ?? [] })
 
     if (silent || held.length === 0) {
       if (lastSig !== null) { lastSig = null; onNotes(null) }
@@ -1239,6 +1467,7 @@ export async function startPredictiveDetection({ onNotes, expected = [], mono, a
       log('stopped')
     },
     setExpected: (m, opts) => engine.setExpected(m, opts),
+    engine,
   }
 }
 

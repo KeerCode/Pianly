@@ -3,6 +3,8 @@ import createVerovioModule from 'verovio/wasm'
 import { VerovioToolkit } from 'verovio/esm'
 import { enableMidi, listenToDevice, onDevicesChanged } from '../input/midiInput'
 import { startPredictiveDetection } from '../input/predictiveDetector'
+import MicSetup from '../MicSetup'
+import { useMicCalibration, calibrationStatus } from '../useMicCalibration'
 import { noteNameToMidi } from '../utils/noteConversion'
 import Background from '../Background'
 import { useTheme } from '../ThemeContext'
@@ -222,6 +224,8 @@ export default function ReadPractice() {
   const [heldNotes, setHeldNotes]         = useState([])     // MIDI ints currently held
   const [targetNotes, setTargetNotes]     = useState([])     // flat sorted MIDI int list for display
   const [micDebug, setMicDebug]           = useState(null)   // live predictive-detector candidate breakdown
+  const [showMicSetup, setShowMicSetup]     = useState(false)
+  const micCal = useMicCalibration()
 
   // ── Refs for use inside callbacks / effects ──
   const vrvRef          = useRef(null)
@@ -552,6 +556,19 @@ export default function ReadPractice() {
               </button>
             ))}
 
+            {inputMethod === 'mic' && (
+              <button
+                onClick={() => setShowMicSetup(true)}
+                className="px-3 py-2 rounded-lg text-sm transition-all cursor-pointer border"
+                style={micCal.noteCount
+                  ? { borderColor: 'var(--border)', color: 'var(--sub)' }
+                  : { borderColor: 'var(--accent)', color: 'var(--accent)', background: 'rgba(0,255,200,0.06)' }}
+                title="Play a few notes once so Pianly learns your piano and mic"
+              >
+                {micCal.noteCount ? `Mic setup · ${calibrationStatus(micCal)}` : 'Set up mic'}
+              </button>
+            )}
+
             <div className="w-px h-5" style={{ background: 'var(--border)' }} />
 
             <button
@@ -576,6 +593,7 @@ export default function ReadPractice() {
             Start
           </button>
         </div>
+        {showMicSetup && <MicSetup onClose={() => setShowMicSetup(false)} />}
       </div>
     )
   }
@@ -770,7 +788,7 @@ export default function ReadPractice() {
               {micDebug.hasNoise ? 'noise profile learned' : 'no noise profile yet'}
             </span>
           </div>
-          <div className="mb-1.5" style={{color:'var(--sub)',opacity:.7}}>rms {micDebug.rms.toFixed(4)}</div>
+          <div className="mb-1.5" style={{color:'var(--sub)',opacity:.7}}>rms {micDebug.rms.toFixed(4)} · {micDebug.calibration ? `calibrated: ${micDebug.calibration}` : 'not calibrated'}</div>
           {micDebug.active.length === 0 && <p style={{color:'var(--sub)',opacity:.5}}>Nothing held.</p>}
           {micDebug.active.map((a) => (
             <div key={a.midi} className="flex items-center justify-between" style={{color: a.expected ? '#4ade80' : '#f87171'}}>
