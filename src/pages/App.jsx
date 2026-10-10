@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { unzipSync } from 'fflate'
 import createVerovioModule from 'verovio/wasm'
 import { VerovioToolkit } from 'verovio/esm'
@@ -11,6 +11,7 @@ import { enableMidi, listenToDevice, notesMatch, onDevicesChanged } from '../inp
 import { startPredictiveDetection } from '../input/predictiveDetector'
 import MicSetup from '../MicSetup'
 import { useMicCalibration, calibrationStatus } from '../useMicCalibration'
+import { octavePairLowers } from '../input/micCalibration'
 import { parseNoteTimelineOSMD } from '../parsers/osmdParser'
 import { tickToSec } from '../parsers/parseTimeline'
 import Background from '../Background'
@@ -180,6 +181,12 @@ function App() {
   const [micDebug, setMicDebug] = useState(null) // live predictive-detector candidate breakdown
   const [showMicSetup, setShowMicSetup] = useState(false)
   const micCal = useMicCalibration()
+  // Lower notes of the octave pairs in the loaded piece — the only notes mic
+  // calibration changes anything for (see MicSetup `pieceMidis`).
+  const pieceMidis = useMemo(
+    () => octavePairLowers(noteTimeline.map((n) => notesToExpectedMidi(n.notes, false))),
+    [noteTimeline],
+  )
 
   const fileInputRef = useRef(null)
   const svgContainerRef = useRef(null)   // Verovio SVG output container
@@ -2256,7 +2263,7 @@ function App() {
         </div>
       )}
 
-      {showMicSetup && <MicSetup onClose={() => setShowMicSetup(false)} />}
+      {showMicSetup && <MicSetup onClose={() => setShowMicSetup(false)} pieceMidis={pieceMidis} />}
 
       {/* Debug panel */}
       {showDebug && (

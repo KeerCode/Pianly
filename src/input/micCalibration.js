@@ -75,13 +75,37 @@ function peakNear(engine, hz) {
 /** Spectral amplitude at `midi`'s fundamental (+-1.2 %). */
 export function fundamentalAmp(engine, midi) { return peakNear(engine, midiToHz(midi)) }
 
-// Default practice set: every white key C2..C5 (app naming, middle C = C3 = 60).
-// Black keys behave like their neighbours' recording conditions, but their
-// partial ratios are NOT interpolated — see "Coverage" in tools/TUNING.md.
+// Setup presets (app naming, middle C = C3 = 60). Partial ratios are NOT
+// interpolated between keys (neighbours differ by up to ~6x), so an uncalibrated
+// key just uses the standard detector — coverage is what the user chooses here.
+//   essential  every white key C2-C5: all of Read Practice, most of the repertoire
+//   bass       white keys E0-B1: the octave pairs below C2 (the weakest register —
+//              see "Known limits" in tools/TUNING.md — so worth having covered).
+//              Note this app names middle C "C3", so a textbook piano's lowest
+//              keys read A-1..D0 here; they sit below the useful range of a
+//              laptop mic and are left to "Everything".
+//   full       every key from the piano's lowest A (shown "A-1") to C6
 export const SETUP_PRESETS = {
-  essential: { label: 'Essential — white keys C2–C5', midis: whiteKeys(48, 84) },
-  chromatic: { label: 'Full — every key C2–C6', midis: range(48, 96) },
+  essential: { label: 'Essential · white keys C2–C5', midis: whiteKeys(48, 84) },
+  bass: { label: 'Bass · white keys E0–B1', midis: whiteKeys(28, 47) },
+  full: { label: 'Everything · every key, lowest A to C6', midis: range(21, 96) },
 }
+/**
+ * Lower notes of the octave pairs in a piece: for each step (array of MIDI
+ * numbers), every note X that has X+12 or X+24 in the SAME step. Those are
+ * exactly the notes calibration can help with (see PitchEngine._applyCalibration).
+ * @param {number[][]} steps
+ * @returns {number[]} sorted, unique
+ */
+export function octavePairLowers(steps) {
+  const out = new Set()
+  for (const step of steps) {
+    const have = new Set(step)
+    for (const m of have) if (have.has(m + 12) || have.has(m + 24)) out.add(m)
+  }
+  return [...out].sort((a, b) => a - b)
+}
+
 function range(a, b) { const o = []; for (let m = a; m <= b; m++) o.push(m); return o }
 function whiteKeys(a, b) { return range(a, b).filter((m) => [0, 2, 4, 5, 7, 9, 11].includes(((m % 12) + 12) % 12)) }
 

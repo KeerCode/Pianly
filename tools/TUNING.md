@@ -364,6 +364,15 @@ named ("I heard G3 — play A2") and not recorded; a key lifted too early, too
 quiet, or an octave off is refused with the reason and re-armed. Each captured
 note is written to storage immediately, so quitting midway keeps the progress.
 
+**What to set up.** Presets (`SETUP_PRESETS`): *This piece* (shown when a
+score is loaded — only the lower notes of the octave pairs it contains, which
+are the only notes calibration changes anything for; Für Elise's demo needs just
+A2), *Essential* (white keys C2–C5, all of Read Practice), *Bass* (white keys
+E0–B1) and *Everything*. Mind the app's naming: middle C is C3, so a textbook
+piano's lowest key (A0) shows as A-1. Very low keys can have a fundamental the
+mic cannot pick out (F0 never locks on, even from a clean recording); the wizard
+says so after ~1.6 s and offers to skip rather than waiting forever.
+
 **Persistence.** `localStorage['pianly-mic-calibration']`, one store with any
 number of named piano *profiles* and one active one (`src/input/micCalibration.js`).
 Setup is done once; every later practice session loads the active profile
@@ -415,8 +424,17 @@ engine mostly missed (8% / 47% detected), are where it helps most.
 
 * *Bass octaves are the weak spot* (A1+A2 61%). A1's own 2nd partial is about
   as loud as A2's fundamental, so with a random strike phase the two can
-  cancel; amplitude alone cannot separate them. No threshold fixes this, only
-  more evidence.
+  cancel; amplitude alone cannot separate them. No threshold fixes this: the
+  `calibK` sweep on A1+A2 is a pure trade-off (false accept / detected:
+  K=1.0 88% / 84%, 1.2 46% / 77%, 1.4 20% / 70%, 1.6 6% / 61%, 2.0 2% / 47%),
+  so the global 1.6 stays — a false accept (advancing on a lone note) is the
+  worse failure.
+* *Tried and rejected: two strikes per note.* Recording a firm and a soft strike
+  and taking the pointwise-max curve was meant to bound the loud-vs-soft swing
+  and let `calibK` drop. On identical held-out dynamics (calibrate FF/Mp, test
+  MF/PP) it was worse: single strike at K=1.6 gave 0% false accept / 89%
+  detected, the two-strike envelope 0% / 79% (K=1.4: 0% / 81%; K=1.2: 26% /
+  87%), because the max raises every threshold. Not shipped.
 * *Fifth pairs (X and X+19, e.g. E2+B3) are not covered* — their 3rd-partial
   coincidence beats against the upper note's fundamental, and the ratio crosses
   over in time (measured). They behave as before.

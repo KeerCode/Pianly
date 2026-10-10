@@ -13,6 +13,7 @@
  *   npm run test:calibration
  *   CALIB_K=2.2 npm run test:calibration      # try another calibK
  *   CALIB_VERBOSE=1 npm run test:calibration  # per-trial lines
+ *   CALIB_SINGLE=FF,Mp CALIB_HELDOUT=MF,PP npm run test:calibration   # calibrate on FF/Mp, test only on MF/PP
  */
 import { execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
@@ -138,11 +139,13 @@ let totals = { faU: 0, faC: 0, faN: 0, dU: 0, dC: 0, dN: 0, latC: [], latU: [], 
 
 for (const pair of PAIRS.filter((p) => !ONLY || ONLY === p.lo + '+' + p.hi)) {
   const per = { faU: 0, faC: 0, faN: 0, dU: 0, dC: 0, dN: 0, latC: [], latU: [] }
-  for (const calDyn of DYNS[pair.lo]) {
+  const HELD = process.env.CALIB_HELDOUT ? process.env.CALIB_HELDOUT.split(',') : null // restrict test dynamics
+  const SINGLE = process.env.CALIB_SINGLE ? process.env.CALIB_SINGLE.split(',') : null // restrict calibration dynamics
+  for (const calDyn of DYNS[pair.lo].filter((d) => !SINGLE || SINGLE.includes(d))) {
     const c = calibrate(calDyn, pair.lo)
     if (!c.entry) { console.log(`  calibration of ${calDyn}_${pair.lo} failed: ${c.error}`); totals.skipped++; continue }
     const calib = { [midiOf(pair.lo)]: c.entry }
-    for (const tLo of DYNS[pair.lo]) for (const tHi of DYNS[pair.hi]) {
+    for (const tLo of DYNS[pair.lo].filter((d) => !HELD || HELD.includes(d))) for (const tHi of DYNS[pair.hi]) {
       for (let k = 0; k < TRIALS; k++) {
         const noiseRms = k === TRIALS - 1 ? 0.004 : 0
         const gLo = 0.6 + rnd() * 0.6, gHi = 0.6 + rnd() * 0.6, delay = rnd() * 0.008

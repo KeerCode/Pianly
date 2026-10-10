@@ -55,9 +55,18 @@ function KeyboardStrip({ target, done }) {
 
 const TONE = { info: 'var(--ink)', ok: '#4ade80', warn: '#f59e0b' }
 
-export default function MicSetup({ onClose, midis: midisProp = null }) {
+/**
+ * @param {object} props
+ * @param {() => void} props.onClose
+ * @param {number[]|null} [props.midis]       force this exact note list (no presets)
+ * @param {number[]|null} [props.pieceMidis]  lower notes of the octave pairs in the
+ *   piece being practised — offered as a "This piece" preset, since those are the
+ *   only notes calibration changes anything for.
+ */
+export default function MicSetup({ onClose, midis: midisProp = null, pieceMidis = null }) {
   const { store, profile, noteCount } = useMicCalibration()
-  const [presetKey, setPresetKey] = useState('essential')
+  const hasPiece = !!(pieceMidis && pieceMidis.length)
+  const [presetKey, setPresetKey] = useState(hasPiece ? 'piece' : 'essential')
   const [running, setRunning] = useState(false)
   const [view, setView] = useState(null)
   const [level, setLevel] = useState(0)
@@ -71,7 +80,11 @@ export default function MicSetup({ onClose, midis: midisProp = null }) {
   const profileIdRef = useRef(profile?.id ?? null)
   useEffect(() => { storeRef.current = store; profileIdRef.current = profile?.id ?? null }, [store, profile])
 
-  const setupNotes = useMemo(() => midisProp ?? SETUP_PRESETS[presetKey].midis, [midisProp, presetKey])
+  const presets = useMemo(() => ({
+    ...(hasPiece ? { piece: { label: `This piece · ${pieceMidis.length} octave-pair note${pieceMidis.length === 1 ? '' : 's'}`, midis: pieceMidis } } : {}),
+    ...SETUP_PRESETS,
+  }), [hasPiece, pieceMidis])
+  const setupNotes = useMemo(() => midisProp ?? (presets[presetKey] ?? presets.essential).midis, [midisProp, presets, presetKey])
   const calibrated = useMemo(() => new Set(Object.keys(profile?.notes ?? {}).map(Number)), [profile])
   const missing = useMemo(() => setupNotes.filter((m) => !calibrated.has(m)), [setupNotes, calibrated])
 
@@ -255,9 +268,9 @@ export default function MicSetup({ onClose, midis: midisProp = null }) {
             {!midisProp && (
               <>
                 <label className="text-xs uppercase tracking-wider font-medium mb-2 block" style={{ color: 'var(--sub)' }}>Notes to set up</label>
-                <div className="flex rounded-lg overflow-hidden text-sm font-medium mb-3" style={{ border: '1px solid var(--border)' }}>
-                  {Object.entries(SETUP_PRESETS).map(([k, p]) => (
-                    <button key={k} onClick={() => setPresetKey(k)} className="flex-1 px-3 py-2 cursor-pointer"
+                <div className="flex flex-col rounded-lg overflow-hidden text-sm font-medium mb-3" style={{ border: '1px solid var(--border)' }}>
+                  {Object.entries(presets).map(([k, p]) => (
+                    <button key={k} onClick={() => setPresetKey(k)} className="px-3 py-2 text-left cursor-pointer"
                       style={presetKey === k ? { background: 'rgba(0,255,200,0.1)', color: 'var(--ink)' } : { color: 'var(--sub)' }}>
                       {p.label}
                     </button>

@@ -125,5 +125,38 @@ check('deleting a piano activates another', st.profiles.length === 1 && st.activ
 mem.set(store.STORE_KEY, '{not json')
 check('corrupt storage degrades to empty, not a crash', store.loadStore().profiles.length === 0)
 
+// ---- lower-note inputs: presets + piece-driven selection ------------------------
+{
+  const P = store.SETUP_PRESETS
+  check('bass preset covers E0-B1 white keys, all below C2', P.bass.midis[0] === 28 && P.bass.midis.at(-1) === 47 && P.bass.midis.every((m) => m < 48), `${P.bass.midis.length} notes`)
+  check('essential preset still C2-C5 white keys', P.essential.midis[0] === 48 && P.essential.midis.at(-1) === 84)
+  const lowers = store.octavePairLowers([[57, 69, 76], [60, 64, 67], [45, 69], [52, 64, 76], [50, 57]])
+  check('octavePairLowers: A2 (+A3), A1 (+A3 two octaves), E2 (+E3,+E4) and E3 (+E4)', JSON.stringify(lowers) === JSON.stringify([45, 52, 57, 64]), JSON.stringify(lowers))
+  check('octavePairLowers: fifths and plain chords are not pairs', store.octavePairLowers([[60, 67], [60, 64, 67]]).length === 0)
+}
+
+// ---- a note the mic cannot lock onto: the wizard says so instead of hanging -------
+{
+  const eng = new PitchEngine(SR, DEFAULT_CONFIG)
+  const sess2 = new CalibrationSession({ engine: eng, midis: [midiOf('F0')], room: false })
+  const sig2 = new Float32Array(Math.round(7 * SR))
+  // a loud, non-pitched thump at 1.0 s with a slow tail: struck, but no F0 in it
+  for (let i = Math.round(1.0 * SR); i < sig2.length; i++) {
+    const t = (i - 1.0 * SR) / SR
+    sig2[i] = 0.12 * Math.exp(-t / 3) * (rnd() * 2 - 1)
+  }
+  const hp2 = highpassInPlace(sig2, SR, DEFAULT_CONFIG.highpassHz)
+  let sawHint = false
+  for (let p = 0; p + DEFAULT_CONFIG.frameSize <= hp2.length; p += hop) {
+    const t = (p + DEFAULT_CONFIG.frameSize) / SR
+    const r = eng.process(hp2.subarray(p, p + DEFAULT_CONFIG.frameSize), t)
+    sess2.feed({ t, rms: r.rms, silent: r.silent, heldMidi: r.heldMidi })
+    if (/can't pick out F0/.test(sess2.view.message)) sawHint = true
+  }
+  check('unlockable note: wizard explains and offers to skip', sawHint, sess2.view.message)
+  sess2.skip()
+  check('unlockable note: skipping moves on and finishes', sess2.finished && sess2.view.skipped.length === 1)
+}
+
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail ? 1 : 0)

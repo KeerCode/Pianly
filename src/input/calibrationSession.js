@@ -25,6 +25,7 @@ const CAPTURE_TRIM_TICKS = 3    // frames dropped from the tail: damper ramp-dow
 const MAX_STRIKE_AGE = 0.35     // a held target counts as THIS strike only if fresh
 const WRONG_NOTE_SECONDS = 0.15 // persistence before "I heard X" is shown
 const OK_FLASH_SECONDS = 0.7
+const UNLOCKABLE_SECONDS = 1.6    // struck, but never recognised as the asked note
 
 export class CalibrationSession {
   /**
@@ -55,6 +56,8 @@ export class CalibrationSession {
     this._quietSince = null
     this._wrongSince = null
     this._okUntil = 0
+    this._listenSince = -Infinity
+    this._unlockSince = null
     this._rec = null
     this._pending = []
     this._lostTicks = 0
@@ -183,6 +186,8 @@ export class CalibrationSession {
         if (this._quietSince == null) this._quietSince = t
         if (t - this._quietSince >= RELEASE_QUIET_SECONDS) {
           this.phase = 'listen'
+          this._listenSince = t
+          this._unlockSince = null
           this._quietSince = null
           this._set(`Play ${noteName(m)}`, 'info')
         }
@@ -229,6 +234,17 @@ export class CalibrationSession {
       } else {
         this._wrongSince = null
         if (this.tone === 'warn') this._set(`Play ${noteName(m)}`, 'info')
+      }
+      // Something was struck, yet this note was never recognised: very low keys
+      // can have a fundamental the mic simply can't pick out. Say so rather than
+      // sit on "Play F0" forever.
+      if (this.phase === 'listen') {
+        const struck = this.engine.lastOnsetAt > this._listenSince && !silent
+        if (struck && this._unlockSince == null) this._unlockSince = t
+        if (!struck && silent) this._unlockSince = null
+        if (this._unlockSince != null && t - this._unlockSince >= UNLOCKABLE_SECONDS && this.tone !== 'warn') {
+          this._set(`I can't pick out ${noteName(m)} on this mic — it may be too low or faint. Skip it; it will use the standard detector.`, 'warn')
+        }
       }
       return this.view
     }
