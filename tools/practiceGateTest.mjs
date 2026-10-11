@@ -265,5 +265,40 @@ console.log('\nF. A genuinely wrong key held for 1.2 s: still blocks, then recov
   check('...and the song finishes once it is released', n.confirmedAll)
 }
 
+
+console.log('\nG. The reported case: hold a whole note while quarter notes are played over it.')
+{
+  // C3 whole note (4 beats) in the left hand; E4, F4, G4 quarter notes in the right hand on beats 2-4.
+  const tl = [
+    { tick: 0, duration: 3840, hand: 'L', notes: ['C3'] },
+    { tick: 960, duration: 960, hand: 'R', notes: ['E4'] },
+    { tick: 1920, duration: 960, hand: 'R', notes: ['F4'] },
+    { tick: 2880, duration: 960, hand: 'R', notes: ['G4'] },
+  ]
+  // The only note asked for on beat 2 is E4, but the whole note is still being held.
+  const o = simulate(tl, 120, 'old', { adaptive: false })
+  const n = simulate(tl, 120, 'new', { adaptive: false })
+  row('old logic', o); row('new gate', n)
+  check('old logic made the player let go of the whole note to progress', !o.confirmedAll && o.stallEpisodes >= 1)
+  check('new gate lets the whole note ring while the quarter notes are played', n.stallEpisodes === 0 && n.confirmedAll, `${n.stallEpisodes} stalls`)
+
+  // A direct, readable check of the same moment.
+  const s2 = new PracticeSession()
+  const startSec = (e) => (e.tick / 960) * 0.5, endSec = (e) => startSec(e) + (e.duration / 960) * 0.5
+  const C3 = noteMidi('C3'), E4 = noteMidi('E4'), F4 = noteMidi('F4'), G4 = noteMidi('G4')
+  s2.noteOn(C3)                                               // C3 down at the start
+  s2.step({ timeline: tl, nowSec: 0, startSec, endSec, noteMidi, nowMs: 0 })
+  s2.noteOn(E4)                                               // E4 on beat 2, C3 still held
+  const r = s2.step({ timeline: tl, nowSec: 0.5, startSec, endSec, noteMidi, nowMs: 600 })
+  check('beat 2: only E4 is asked for, and the held C3 is not a wrong key', r.required.size === 1 && r.required.has(E4) && r.extras.length === 0 && r.state === 'satisfied', JSON.stringify({ req: [...r.required], extras: r.extras, state: r.state }))
+  // ...but once the whole note is over (4 beats + grace) and still held, it IS a stray key.
+  s2.noteOn(F4)                                               // F4
+  s2.step({ timeline: tl, nowSec: 1.0, startSec, endSec, noteMidi, nowMs: 1100 })
+  s2.noteOn(G4)                                               // G4 at beat 4
+  // G4 is asked for at 1.5 s; by 3.0 s the whole note (2.0 s long, +0.35 s grace) is long over.
+  const late = s2.step({ timeline: tl, nowSec: 3.0, startSec, endSec, noteMidi, nowMs: 3100 })
+  check('well after its written end, a still-held C3 is reported as a key to let go of', late.extras.includes(C3) && late.state === 'blocked', JSON.stringify({ req: [...late.required], extras: late.extras, state: late.state }))
+}
+
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail ? 1 : 0)
