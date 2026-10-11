@@ -12,6 +12,7 @@
     "test:calibration": "node tools/calibrationTest.mjs",
     "test:wizard": "node tools/wizardTest.mjs",
     "test:take": "node tools/takeTest.mjs",
+    "test:practice": "node tools/practiceGateTest.mjs",
     "replay": "node tools/replayTake.mjs",
     "analyze": "node tools/analyzeAudio.mjs",
     "tauri": "tauri",

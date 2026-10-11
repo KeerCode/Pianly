@@ -1,6 +1,7 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { unzipSync } from 'fflate'
 import { parseNoteTimeline, tickToSec as tempoMapTickToSec } from '../parsers/parseTimeline'
+import { PracticeSession } from '../practice/practiceGate'
 import { parseMidiFile } from '../parsers/parseMidi'
 import { DEMO_PIECES, loadDemoScore } from '../data/demoScores'
 import { getSavedFolder, pickFolder, listScores, loadScore } from '../lib/scoreFolder'
@@ -111,7 +112,6 @@ const DEFAULT_RIGHT_COLOR = '#3b82f6'
 const DEFAULT_LEFT_COLOR  = '#22c55e'
 const DEFAULT_PLAYBACK_SPEED = 1.0
 const FALL_PX_PER_SEC = 200
-const GRACE_MS = 150       // ms before practice pause triggers
 const CHORD_TICK_WINDOW = 15  // ticks — entries within this range are one chord
 
 // ---------------------------------------------------------------------------
@@ -147,6 +147,7 @@ export default function Visualizer() {
   const [practiceWaiting, setPracticeWaiting] = useState(false) // true = waiting for first keypress to start
   const [practiceStatus, setPracticeStatus] = useState('playing') // 'playing' | 'waiting'
   const [targetNoteNames, setTargetNoteNames] = useState([])     // e.g. ['C4', 'E4']
+  const [blockKind, setBlockKind] = useState('play')               // 'play' = notes still needed, 'release' = key to let go of
   const [midiDevices, setMidiDevices] = useState([])
   const [selectedDeviceId, setSelectedDeviceId] = useState(null)
 
@@ -167,12 +168,20 @@ export default function Visualizer() {
   const settingsRef    = useRef({ playbackSpeed: DEFAULT_PLAYBACK_SPEED, rightColor: DEFAULT_RIGHT_COLOR, leftColor: DEFAULT_LEFT_COLOR, showNoteNames: true, showKeyLabels: true, soundEnabled: true })
 
   // Practice refs (read inside draw loop — must be refs not state)
-  const heldMidiRef       = useRef(new Set())   // MIDI notes currently held by user
+  // The gate owns key state and progress (see src/practice/practiceGate.js). The
+  // refs below are views onto it so the rest of this file keeps working.
+  const sessionRef = useRef(null)
+  if (sessionRef.current === null) sessionRef.current = new PracticeSession()
+  const heldMidiRef       = useRef(sessionRef.current.held)   // MIDI notes currently held by user
   const practiceModeRef   = useRef(false)        // mirror of practiceMode state
   const practicePausedRef = useRef(false)        // true when practice auto-paused
   const targetMidiRef     = useRef(new Set())    // notes user must press to resume
-  const confirmedTickRef  = useRef(-1)           // highest musical tick confirmed so far
-  const graceStartRef     = useRef(null)         // rAF timestamp when grace window opened
+  // highest musical tick confirmed so far — lives in the session
+  const confirmedTickRef  = useMemo(() => ({
+    get current() { return sessionRef.current.confirmedTick },
+    set current(v) { sessionRef.current.confirmedTick = v },
+  }), [])
+  const targetKeyRef      = useRef('')           // last target-name list pushed to the UI (gate thrash)
   const midiStopRef       = useRef(null)         // MIDI unlisten/disconnect fn
   const lastStatusRef     = useRef('playing')    // gate setPracticeStatus to avoid thrash
   const practiceWaitingRef = useRef(false)       // mirror of practiceWaiting for use inside MIDI handler
@@ -228,10 +237,9 @@ export default function Visualizer() {
 
   // ── Reset practice tracking when file changes ─────────────────────────────
   useEffect(() => {
-    confirmedTickRef.current = -1
+    sessionRef.current.reset()
     practicePausedRef.current = false
     targetMidiRef.current = new Set()
-    graceStartRef.current = null
     lastStatusRef.current = 'playing'
     setPracticeStatus('playing')
     setTargetNoteNames([])
@@ -313,7 +321,7 @@ export default function Visualizer() {
           const noteName = event.payload?.note ?? event.payload
           const midi = noteNameToMidi(String(noteName))
           if (midi != null) {
-            heldMidiRef.current.add(midi)
+            sessionRef.current.noteOn(midi)
             if (practiceWaitingRef.current) {
               practiceWaitingRef.current = false
               setPracticeWaiting(false)
@@ -331,7 +339,7 @@ export default function Visualizer() {
         unlistenOff = await listen('midi-note-off', (event) => {
           const noteName = event.payload?.note ?? event.payload
           const midi = noteNameToMidi(String(noteName))
-          if (midi != null) heldMidiRef.current.delete(midi)
+          if (midi != null) sessionRef.current.noteOff(midi)
         })
       } catch (err) {
         console.error('[Visualizer] listen(midi-note-off) failed:', err)
@@ -353,17 +361,16 @@ export default function Visualizer() {
       cancelled = true
       unlistenOn?.(); unlistenOff?.()
       invoke('disconnect_midi').catch(() => {})
-      heldMidiRef.current.clear()
+      sessionRef.current.clearKeys()
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Practice mode teardown (clear practice state when toggled off) ────────
   useEffect(() => {
     if (!practiceMode) {
-      heldMidiRef.current.clear()
+      sessionRef.current.clearKeys()
       practicePausedRef.current = false
       targetMidiRef.current = new Set()
-      graceStartRef.current = null
       if (lastStatusRef.current !== 'playing') {
         lastStatusRef.current = 'playing'
         setPracticeStatus('playing')
@@ -405,7 +412,7 @@ export default function Visualizer() {
         ps.elapsed = (timestamp - ps.startTime) / 1000 + ps.pausedAt
       }
     }
-    const currentTimeSec = ps.elapsed
+    let currentTimeSec = ps.elapsed
 
     const whiteKeyH = Math.max(h * WHITE_KEY_H_RATIO, 60)
     const blackKeyH = whiteKeyH * BLACK_KEY_H_RATIO
@@ -421,6 +428,68 @@ export default function Visualizer() {
 
     const tMap = ps.tempoMap || [{ tick: 0, bpm: ps.tempo || 120 }]
     const tickToSec = (tick) => tempoMapTickToSec(tick, tMap) / speed
+
+    // ── Practice gate ───────────────────────────────────────────────────────
+    // Runs BEFORE any bar is drawn: if what is being asked for is not played, the
+    // clock stops exactly on its landing, so the bars on screen are the ones the
+    // game is waiting for (they used to scroll past during a 150 ms grace).
+    const practMode_ = practiceModeRef.current
+    if (practMode_ && ps.timeline && ps.timeline.length > 0) {
+      const startSecOf = (e) => tickToSec(e.tick) + leadInSec
+      const endSecOf = (e) => startSecOf(e) + (e.durationSec != null
+        ? e.durationSec / speed
+        : tickToSec(e.tick + e.duration) - tickToSec(e.tick))
+      const g = sessionRef.current.step({
+        timeline: ps.timeline,
+        nowSec: currentTimeSec,
+        startSec: startSecOf,
+        endSec: endSecOf,
+        noteMidi: noteNameToMidi,
+        nowMs: timestamp,
+      })
+
+      // Only the running song (or one the gate itself stopped) is gated; a user
+      // pause or a song that has not started is left alone.
+      const gated = ps.playing || practicePausedRef.current
+      if (g.required.size > 0 && g.state !== 'satisfied' && gated) {
+        if (ps.playing) {
+          ps.playing = false
+          ps.pausedAt = g.landSec
+          ps.elapsed = g.landSec
+          ps.audioStartTime = null
+          ps.startTime = 0
+          practicePausedRef.current = true
+          currentTimeSec = g.landSec
+        }
+        const releasing = g.missing.length === 0 && g.extras.length > 0
+        const names = (releasing ? g.extras : g.missing.length ? g.missing : [...g.required]).map(midiToNoteName)
+        targetMidiRef.current = new Set(releasing ? [] : g.missing.length ? g.missing : g.required)
+        if (g.showWaiting) {
+          const key = (releasing ? 'release:' : 'play:') + names.join(',')
+          if (lastStatusRef.current !== 'waiting') synthRef.current?.stopAll()
+          if (lastStatusRef.current !== 'waiting' || key !== targetKeyRef.current) {
+            lastStatusRef.current = 'waiting'
+            targetKeyRef.current = key
+            setPracticeStatus('waiting')
+            setBlockKind(releasing ? 'release' : 'play')
+            setTargetNoteNames(names)
+          }
+        }
+      } else if ((g.state === 'satisfied' || g.required.size === 0) && gated) {
+        if (practicePausedRef.current) {
+          practicePausedRef.current = false
+          targetMidiRef.current = new Set()
+          ps.playing = true
+          ps.startTime = 0
+        }
+        if (lastStatusRef.current !== 'playing') {
+          lastStatusRef.current = 'playing'
+          targetKeyRef.current = ''
+          setPracticeStatus('playing')
+          setTargetNoteNames([])
+        }
+      }
+    }
 
     const activeKeys = {}
 
@@ -483,86 +552,11 @@ export default function Visualizer() {
       }
     }
 
-    // ── Practice mode logic ─────────────────────────────────────────────────
-    const practMode = practiceModeRef.current
+    // Practice gating happened above, before the bars were drawn.
+    const practMode = practMode_
     const heldMidi = heldMidiRef.current
     const practicePaused = practicePausedRef.current
     const targetMidi = targetMidiRef.current
-    let requiredMidi = new Set()
-
-    if (practMode && ps.timeline && ps.timeline.length > 0) {
-      // Find the first unconfirmed tick that has landed
-      let firstUnconfirmedTick = Infinity
-      for (const entry of ps.timeline) {
-        if (entry.tick <= confirmedTickRef.current) continue
-        const noteStartSec = tickToSec(entry.tick) + leadInSec
-        if (noteStartSec <= currentTimeSec + 0.02) {
-          firstUnconfirmedTick = entry.tick
-          break // timeline sorted by tick — first match is earliest
-        }
-      }
-
-      // Collect all MIDI notes in this chord group (within CHORD_TICK_WINDOW)
-      if (firstUnconfirmedTick < Infinity) {
-        for (const entry of ps.timeline) {
-          if (entry.tick < firstUnconfirmedTick - 5) continue
-          if (entry.tick > firstUnconfirmedTick + CHORD_TICK_WINDOW) break
-          const noteStartSec = tickToSec(entry.tick) + leadInSec
-          if (noteStartSec <= currentTimeSec + 0.02) {
-            for (const n of entry.notes) {
-              const m = noteNameToMidi(n)
-              if (m != null) requiredMidi.add(m)
-            }
-          }
-        }
-      }
-
-      const allHeld  = requiredMidi.size === 0 || [...requiredMidi].every(m => heldMidi.has(m))
-      // true if every held note is a valid target (user is building the chord correctly)
-      const noExtras = [...heldMidi].every(m => requiredMidi.has(m))
-
-
-      if (allHeld && noExtras && requiredMidi.size > 0) {
-        // All required notes held and no extras — confirm chord
-        confirmedTickRef.current = firstUnconfirmedTick + CHORD_TICK_WINDOW
-        graceStartRef.current = null
-        if (practicePaused) {
-          practicePausedRef.current = false
-          targetMidiRef.current = new Set()
-          ps.playing = true
-          ps.startTime = 0
-          if (lastStatusRef.current !== 'playing') {
-            lastStatusRef.current = 'playing'
-            setPracticeStatus('playing')
-            setTargetNoteNames([])
-          }
-        }
-      } else if (!allHeld && noExtras && heldMidi.size > 0 && requiredMidi.size > 0) {
-        // User is building the chord correctly (all held notes are valid targets,
-        // just not all pressed yet). Reset grace timer — don't penalise.
-        graceStartRef.current = null
-      } else if (requiredMidi.size > 0 && ps.playing) {
-        // Wrong/extra key held, no keys held, or missing notes with extras — grace timer then pause
-        if (graceStartRef.current === null) {
-          graceStartRef.current = timestamp
-        } else if (timestamp - graceStartRef.current > GRACE_MS) {
-          graceStartRef.current = null
-          ps.playing = false
-          ps.pausedAt = ps.elapsed
-          ps.audioStartTime = null
-          practicePausedRef.current = true
-          targetMidiRef.current = new Set(requiredMidi)
-          synthRef.current?.stopAll()
-          if (lastStatusRef.current !== 'waiting') {
-            lastStatusRef.current = 'waiting'
-            setPracticeStatus('waiting')
-            setTargetNoteNames([...requiredMidi].map(midiToNoteName))
-          }
-        }
-      } else {
-        graceStartRef.current = null
-      }
-    }
 
     // Divider
     ctx.fillStyle = '#333'
@@ -659,8 +653,7 @@ export default function Visualizer() {
   function resetPracticeState() {
     practicePausedRef.current = false
     targetMidiRef.current = new Set()
-    confirmedTickRef.current = -1
-    graceStartRef.current = null
+    sessionRef.current.reset()
     if (lastStatusRef.current !== 'playing') {
       lastStatusRef.current = 'playing'
       setPracticeStatus('playing')
@@ -724,7 +717,6 @@ export default function Visualizer() {
       // Clear any lingering practice-pause state
       practicePausedRef.current = false
       targetMidiRef.current = new Set()
-      graceStartRef.current = null
       if (lastStatusRef.current !== 'playing') {
         lastStatusRef.current = 'playing'
         setPracticeStatus('playing')
@@ -745,7 +737,6 @@ export default function Visualizer() {
     const ps = playStateRef.current
     ps.playing = false; ps.pausedAt = ps.elapsed; ps.audioStartTime = null
     practicePausedRef.current = false
-    graceStartRef.current = null
     setPlaying(false)
     synthRef.current?.stopAll()
   }
@@ -993,7 +984,7 @@ export default function Visualizer() {
               : {background:'var(--panel)',borderBottom:'1px solid var(--border)'}}>
             {practiceStatus === 'waiting' ? (
               <span className="text-xs font-semibold" style={{color:'var(--ink)',opacity:.85}}>
-                Waiting for: {targetNoteNames.join(' + ')}
+                {blockKind === 'release' ? 'Let go of' : 'Waiting for'}: {targetNoteNames.join(' + ')}
               </span>
             ) : (
               <span className="text-xs font-medium" style={{color:'var(--ink)',opacity:.85}}>Playing</span>
