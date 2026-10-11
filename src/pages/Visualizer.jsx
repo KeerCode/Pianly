@@ -109,7 +109,9 @@ function createSynth() {
 const DEFAULT_RIGHT_COLOR = '#3b82f6'
 const DEFAULT_LEFT_COLOR  = '#22c55e'
 const DEFAULT_PLAYBACK_SPEED = 1.0
-const FALL_PX_PER_SEC = 200
+const FALL_PX_PER_SEC = 200   // pixels per second of SCORE time; the speed setting changes how
+                              // fast score time passes, so bars fall slower/faster, same length
+const REWIND_MS = 160         // how long the sheet takes to ease back to a missed note
 const CHORD_TICK_WINDOW = 15  // ticks — entries within this range are one chord
 
 // ---------------------------------------------------------------------------
@@ -153,7 +155,8 @@ export default function Visualizer() {
   const animRef        = useRef(null)
   const synthRef       = useRef(null)
   const playedNotesRef = useRef(new Set())
-  const playStateRef   = useRef({ playing: false, startTime: 0, elapsed: 0, pausedAt: 0, audioStartTime: null })
+  // elapsed / pausedAt are SCORE seconds; they advance at `speed` per real second.
+  const playStateRef   = useRef({ playing: false, startTime: 0, elapsed: 0, pausedAt: 0, audioStartTime: null, speed: 1 })
   const settingsRef    = useRef({ playbackSpeed: DEFAULT_PLAYBACK_SPEED, rightColor: DEFAULT_RIGHT_COLOR, leftColor: DEFAULT_LEFT_COLOR, showNoteNames: true, showKeyLabels: true, soundEnabled: true })
 
   // Practice refs (read inside draw loop — must be refs not state)
@@ -164,6 +167,7 @@ export default function Visualizer() {
   const heldMidiRef       = useRef(sessionRef.current.held)   // MIDI notes currently held by user
   const practiceModeRef   = useRef(false)        // mirror of practiceMode state
   const practicePausedRef = useRef(false)        // true when practice auto-paused
+  const rewindRef         = useRef(null)         // { from, to, startMs }: the sheet easing back to a missed note
   const targetMidiRef     = useRef(new Set())    // notes user must press to resume
   // highest musical tick confirmed so far — lives in the session
   const confirmedTickRef  = useMemo(() => ({
@@ -228,6 +232,7 @@ export default function Visualizer() {
   useEffect(() => {
     sessionRef.current.reset()
     practicePausedRef.current = false
+    rewindRef.current = null
     targetMidiRef.current = new Set()
     lastStatusRef.current = 'playing'
     setPracticeStatus('playing')
@@ -359,6 +364,7 @@ export default function Visualizer() {
     if (!practiceMode) {
       sessionRef.current.clearKeys()
       practicePausedRef.current = false
+      rewindRef.current = null
       targetMidiRef.current = new Set()
       if (lastStatusRef.current !== 'playing') {
         lastStatusRef.current = 'playing'
@@ -392,14 +398,25 @@ export default function Visualizer() {
 
     if (ps.playing) {
       const audioCtx = synthRef.current?.getCtx?.()
+      // Real seconds since play/resume, from the audio clock when there is one
+      // (visuals and audio stay locked), else from rAF timestamps.
+      let realSec
       if (audioCtx && ps.audioStartTime != null) {
-        // Use audio clock as the single source of truth — visuals and audio stay locked
-        ps.elapsed = (audioCtx.currentTime - ps.audioStartTime) + ps.pausedAt
+        realSec = audioCtx.currentTime - ps.audioStartTime
       } else {
-        // Fallback when sound is off: use rAF timestamps
         if (ps.startTime === 0) ps.startTime = timestamp
-        ps.elapsed = (timestamp - ps.startTime) / 1000 + ps.pausedAt
+        realSec = (timestamp - ps.startTime) / 1000
       }
+      ps.elapsed = ps.pausedAt + realSec * ps.speed
+      if (speed !== ps.speed) {
+        // Speed changed while playing: keep the position, change only the rate.
+        ps.pausedAt = ps.elapsed
+        ps.speed = speed
+        if (audioCtx && ps.audioStartTime != null) ps.audioStartTime = audioCtx.currentTime
+        else ps.startTime = timestamp
+      }
+    } else {
+      ps.speed = speed
     }
     let currentTimeSec = ps.elapsed
 
@@ -407,6 +424,9 @@ export default function Visualizer() {
     const blackKeyH = whiteKeyH * BLACK_KEY_H_RATIO
     const layout = buildKeyLayout(w)
     const keyboardTop = h - whiteKeyH
+    // Everything below is in score seconds: one second of score is always
+    // FALL_PX_PER_SEC pixels, and the speed setting only changes how fast the
+    // clock above moves through it (bars fall slower or faster, same length).
     const leadInSec = keyboardTop / FALL_PX_PER_SEC
 
     const rColorDark = darkenColor(rColor, 0.5)
@@ -416,18 +436,34 @@ export default function Visualizer() {
     ctx.fillRect(0, 0, w, h)
 
     const tMap = ps.tempoMap || [{ tick: 0, bpm: ps.tempo || 120 }]
-    const tickToSec = (tick) => tempoMapTickToSec(tick, tMap) / speed
+    const tickToSec = (tick) => tempoMapTickToSec(tick, tMap)
+
+    // Status bar + pulsing key outlines for what the stopped song is waiting for.
+    const showWaitingFor = (g) => {
+      const releasing = g.missing.length === 0 && g.extras.length > 0
+      const wanted = releasing ? [] : g.missing.length ? g.missing : [...g.required]
+      const names = (releasing ? g.extras : wanted).map(midiToNoteName)
+      targetMidiRef.current = new Set(wanted)
+      const key = (releasing ? 'release:' : 'play:') + names.join(',')
+      if (lastStatusRef.current !== 'waiting' || key !== targetKeyRef.current) {
+        lastStatusRef.current = 'waiting'
+        targetKeyRef.current = key
+        setPracticeStatus('waiting')
+        setBlockKind(releasing ? 'release' : 'play')
+        setTargetNoteNames(names)
+      }
+    }
 
     // ── Practice gate ───────────────────────────────────────────────────────
-    // Runs BEFORE any bar is drawn: if what is being asked for is not played, the
-    // clock stops exactly on its landing, so the bars on screen are the ones the
-    // game is waiting for (they used to scroll past during a 150 ms grace).
-    const practMode_ = practiceModeRef.current
-    let pinGroupTick = null   // while stopped, the asked-for bars stay on the keys
-    if (practMode_ && ps.timeline && ps.timeline.length > 0) {
+    // Runs before any bar is drawn. A note played within the lateness grace
+    // costs nothing (see practiceGate). Later than that, the song stops and the
+    // whole sheet eases back to the moment the missed notes touched the keys,
+    // then waits there until they are played.
+    let drawTimeSec = currentTimeSec
+    if (practiceModeRef.current && ps.timeline && ps.timeline.length > 0) {
       const startSecOf = (e) => tickToSec(e.tick) + leadInSec
       const endSecOf = (e) => startSecOf(e) + (e.durationSec != null
-        ? e.durationSec / speed
+        ? e.durationSec
         : tickToSec(e.tick + e.duration) - tickToSec(e.tick))
       const g = sessionRef.current.step({
         timeline: ps.timeline,
@@ -437,51 +473,44 @@ export default function Visualizer() {
         noteMidi: noteNameToMidi,
         nowMs: timestamp,
       })
+      const done = g.state === 'satisfied' || g.required.size === 0
 
-      // Only the running song (or one the gate itself stopped) is gated; a user
-      // pause or a song that has not started is left alone.
-      const gated = ps.playing || practicePausedRef.current
-      // `overdue`: the player is later than the lateness grace (see practiceGate).
-      // Inside the grace the song just keeps flowing, so a few ms of timing noise
-      // per note cannot add up to a slower song.
-      if (g.required.size > 0 && g.state !== 'satisfied' && g.overdue && gated) {
-        if (ps.playing) {
-          ps.playing = false
-          ps.pausedAt = g.holdAt
-          ps.elapsed = g.holdAt
-          ps.audioStartTime = null
-          ps.startTime = 0
-          practicePausedRef.current = true
-          currentTimeSec = g.holdAt
-        }
-        pinGroupTick = g.groupTick
-        const releasing = g.missing.length === 0 && g.extras.length > 0
-        const names = (releasing ? g.extras : g.missing.length ? g.missing : [...g.required]).map(midiToNoteName)
-        targetMidiRef.current = new Set(releasing ? [] : g.missing.length ? g.missing : g.required)
-        if (g.showWaiting) {
-          const key = (releasing ? 'release:' : 'play:') + names.join(',')
-          if (lastStatusRef.current !== 'waiting') synthRef.current?.stopAll()
-          if (lastStatusRef.current !== 'waiting' || key !== targetKeyRef.current) {
-            lastStatusRef.current = 'waiting'
-            targetKeyRef.current = key
-            setPracticeStatus('waiting')
-            setBlockKind(releasing ? 'release' : 'play')
-            setTargetNoteNames(names)
-          }
-        }
-      } else if ((g.state === 'satisfied' || g.required.size === 0) && gated) {
-        if (practicePausedRef.current) {
+      if (practicePausedRef.current) {
+        if (done) {
           practicePausedRef.current = false
+          rewindRef.current = null
           targetMidiRef.current = new Set()
           ps.playing = true
           ps.startTime = 0
+        } else {
+          showWaitingFor(g)
         }
-        if (lastStatusRef.current !== 'playing') {
-          lastStatusRef.current = 'playing'
-          targetKeyRef.current = ''
-          setPracticeStatus('playing')
-          setTargetNoteNames([])
-        }
+      } else if (ps.playing && !done && g.overdue) {
+        // A user pause (ps.playing false) is never gated.
+        ps.playing = false
+        ps.pausedAt = g.landSec
+        ps.elapsed = g.landSec
+        ps.audioStartTime = null
+        ps.startTime = 0
+        practicePausedRef.current = true
+        rewindRef.current = { from: currentTimeSec, to: g.landSec, startMs: timestamp }
+        currentTimeSec = g.landSec
+        synthRef.current?.stopAll()
+        showWaitingFor(g)
+      }
+      if (!practicePausedRef.current && lastStatusRef.current !== 'playing') {
+        lastStatusRef.current = 'playing'
+        targetKeyRef.current = ''
+        setPracticeStatus('playing')
+        setTargetNoteNames([])
+      }
+      const rw = rewindRef.current
+      if (rw) {
+        const k = Math.min(1, (timestamp - rw.startMs) / REWIND_MS)
+        drawTimeSec = rw.from + (rw.to - rw.from) * (1 - Math.pow(1 - k, 3)) // ease out
+        if (k >= 1) rewindRef.current = null
+      } else {
+        drawTimeSec = currentTimeSec
       }
     }
 
@@ -492,13 +521,9 @@ export default function Visualizer() {
         const entry = ps.timeline[ei]
         const noteStartSec = tickToSec(entry.tick) + leadInSec
         const noteDurSec = entry.durationSec != null
-          ? entry.durationSec / speed
+          ? entry.durationSec
           : tickToSec(entry.tick + entry.duration) - tickToSec(entry.tick)
-        let timeUntilLand = noteStartSec - currentTimeSec
-        // The notes being waited for stay exactly on the keys, even though the
-        // clock stopped a little after they landed (a short bar would otherwise
-        // have scrolled out of sight while still being asked for).
-        if (pinGroupTick !== null && entry.tick >= pinGroupTick - 5 && entry.tick <= pinGroupTick + CHORD_TICK_WINDOW && timeUntilLand < 0) timeUntilLand = 0
+        const timeUntilLand = noteStartSec - drawTimeSec
         const barBottom = keyboardTop - timeUntilLand * FALL_PX_PER_SEC
         const barH = Math.max(noteDurSec * FALL_PX_PER_SEC, 6)
         const barTop = barBottom - barH
@@ -551,7 +576,7 @@ export default function Visualizer() {
     }
 
     // Practice gating happened above, before the bars were drawn.
-    const practMode = practMode_
+    const practMode = practiceModeRef.current
     const heldMidi = heldMidiRef.current
     const practicePaused = practicePausedRef.current
     const targetMidi = targetMidiRef.current
@@ -650,6 +675,7 @@ export default function Visualizer() {
   // ── Playback handlers ─────────────────────────────────────────────────────
   function resetPracticeState() {
     practicePausedRef.current = false
+    rewindRef.current = null
     targetMidiRef.current = new Set()
     sessionRef.current.reset()
     if (lastStatusRef.current !== 'playing') {
@@ -681,9 +707,8 @@ export default function Visualizer() {
       const whiteKeyH = Math.max(h * WHITE_KEY_H_RATIO, 60)
       const keyboardTop = h - whiteKeyH
       const leadInSec = keyboardTop / FALL_PX_PER_SEC
-      const speed = settingsRef.current.playbackSpeed
       const tMap = ps.tempoMap || [{ tick: 0, bpm: ps.tempo || 120 }]
-      const tts = (tick) => tempoMapTickToSec(tick, tMap) / speed
+      const tts = (tick) => tempoMapTickToSec(tick, tMap)
 
       // Find the first unconfirmed note that has already landed (or is landing)
       // at the current paused position
@@ -714,6 +739,7 @@ export default function Visualizer() {
 
       // Clear any lingering practice-pause state
       practicePausedRef.current = false
+      rewindRef.current = null
       targetMidiRef.current = new Set()
       if (lastStatusRef.current !== 'playing') {
         lastStatusRef.current = 'playing'
@@ -735,6 +761,7 @@ export default function Visualizer() {
     const ps = playStateRef.current
     ps.playing = false; ps.pausedAt = ps.elapsed; ps.audioStartTime = null
     practicePausedRef.current = false
+    rewindRef.current = null
     setPlaying(false)
     synthRef.current?.stopAll()
   }

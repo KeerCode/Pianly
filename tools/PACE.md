@@ -43,18 +43,27 @@ registered, so every note arrived twice (`listenToDevice` now serialises).
 
 ## Visualizer (wait mode)
 
-| | before | after |
+| | before | now |
 |---|---|---|
-| song length played at the written tempo (177.3 s piece) | 209-233 s (18-31% slow) with the first version of the stop-the-clock fix | 178-180 s (**0.5-1.5% slow**) |
+| song length played at the written tempo (177.3 s piece, six simulated players) | 209-233 s (18-31% slow) with the first stop-the-clock fix | 179-182 s (**1.1-2.8% slow**) |
 | an ideal player interrupted | 26-44 times per piece | 0 |
-| real page, real time | | 179.9 s for a 178.1 s song (1.0%), 11 clock stops, longest 272 ms |
 
-The clock must not stop on human timing noise. Stopping it the instant a bar
-landed made every note played a few ms late hold the song, and a note played
-early never bought the time back (~800 stalls of a few ms, all cumulative). Now a
-note within `lateGraceSec` (0.12 s) of its landing costs nothing; past that the
-clock stops 0.12 s after the landing and the asked-for bars are pinned to the
-keys. See `src/practice/practiceGate.js`.
+* A note played within `lateGraceSec` (0.12 s) of its landing costs nothing: the
+  song keeps flowing, so a few ms of timing noise per note can't add up.
+* Later than that, the song stops and the **whole sheet eases back** (~160 ms)
+  to the moment the missed notes touched the keys, then waits there until they
+  are played. (Earlier versions froze 0.12 s past the landing and pushed only
+  the missed bars back up.) Each such stop costs the grace plus the lateness,
+  which is the 1-3% above.
+* Keys already pressed for notes landing within `earlyWindowSec` (0.3 s) are early
+  presses, not stray keys; this has to cover the rewind distance, or keys pressed
+  for the next chord would turn into "Let go of" the moment the sheet went back.
+* **Speed** changes how fast the bars fall, not their length: the song position
+  is kept in score time and advances at `speed` per second; one second of score
+  is always 200 px. Changing speed mid-song keeps the position (no jump).
+  Measured on the page: 216 / 102 / 396 px/s at 1x / 0.5x / 2x, bar length
+  48.5 px at all three. Timing allowances (grace, early window) are in score
+  time, so they are a little more forgiving at slow speeds.
 
 ## Limits
 

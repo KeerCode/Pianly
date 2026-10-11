@@ -82,7 +82,7 @@ function simulate(timeline, bpm, gate, p = {}) {
   let song = 0, wall = 0, playing = true
   const stats = {
     entries: timeline.length, stallMs: 0, stallEpisodes: 0, falseConfirms: 0, vanishedAtStall: 0,
-    maxOvershootPx: 0, finished: false, wrongNoteStallMs: 0, adaptations: 0,
+    maxOvershootPx: 0, restOvershootPx: 0, finished: false, wrongNoteStallMs: 0, adaptations: 0,
   }
   const landedWall = new Map()     // entry index -> wall ms when it landed on screen
   const pressedAt = new Map()      // entry index -> true
@@ -91,6 +91,7 @@ function simulate(timeline, bpm, gate, p = {}) {
   const usedSeq = new Map()        // midi -> number of those already spent confirming a note
   const lastPressWall = new Map()  // (kept for the adaptive player's bookkeeping)
   let stalled = false
+  let vizPaused = false
   let lastRequired = new Set(), lastRequiredLegacy = new Set()
   let stray = p.stray ? { ...p.stray, done: false, on: false } : null
   const lateMs = p.lateMs ?? 0
@@ -149,15 +150,18 @@ function simulate(timeline, bpm, gate, p = {}) {
       required = r.required; confirmed = r.confirmed
       if (r.required.size) lastRequired = r.required
       // The clock keeps flowing through the lateness grace, then stops just after the landing.
-      blocked = r.required.size > 0 && r.state !== 'satisfied' && r.overdue
+      // Mirrors Visualizer.jsx: late beyond the grace -> back to the landing, wait there.
+      const done = r.state === 'satisfied' || r.required.size === 0
       landSec = r.landSec
-      if (blocked) nextSong = Math.min(nextSong, r.holdAt)
+      if (vizPaused) { if (done) vizPaused = false; else { blocked = true; nextSong = r.landSec } }
+      else if (!done && r.overdue) { blocked = true; vizPaused = true; nextSong = r.landSec }
+      if (vizPaused) stats.restOvershootPx = Math.max(stats.restOvershootPx, Math.abs(nextSong - landSec) * FALL_PX_PER_SEC)
       if (stray && !stray.done && stray.on && blocked) stats.wrongNoteStallMs += dtMs
       if (p.debug && blocked && !stalled && !simulate._dbg) {
         simulate._dbg = true
         console.log('       [debug] first block at song', nextSong.toFixed(3), 'group tick', r.groupTick, 'required', [...r.required], 'held', [...sess.held], 'pressed', [...sess.pressed], 'missing', r.missing, 'extras', r.extras)
       }
-      const showing = blocked && r.showWaiting
+      const showing = blocked
       if (showing && !stalled) { stats.stallEpisodes++; stalled = true } else if (!showing) stalled = false
       if (showing) stats.stallMs += dtMs
       if (blocked) {
@@ -244,9 +248,10 @@ for (const [name, tl, bpm] of PIECES) {
   const o = simulate(tl, bpm, 'old', { lateMs: 250 })
   const n = simulate(tl, bpm, 'new', { lateMs: 250 })
   console.log(`     ${name}`); row('old logic', o); row('new gate', n)
-  // The clock stops lateGraceSec (0.12 s = 24 px) after the landing and the page pins the
-  // asked-for bars to the keys, so what is waited for is always on screen.
-  check(`${name}: new gate stops within the lateness grace of the asked-for notes`, n.maxOvershootPx <= 0.12 * FALL_PX_PER_SEC + 1.5, `overshoot ${n.maxOvershootPx.toFixed(1)} px`)
+  // Within the 0.12 s grace the bars may run up to 24 px past the keys; past it the
+  // whole sheet goes back, so while waiting the asked-for notes sit exactly on the keys.
+  check(`${name}: while waiting, the asked-for notes sit exactly on the keys`, n.restOvershootPx < 0.5, `${n.restOvershootPx.toFixed(1)} px`)
+  check(`${name}: and the bars never run further past than the grace`, n.maxOvershootPx <= 0.12 * FALL_PX_PER_SEC + 4, `${n.maxOvershootPx.toFixed(1)} px`)
   check(`${name}: new gate still gets to the end`, n.confirmedAll)
   check(`${name}: old logic let bars scroll past before pausing`, o.maxOvershootPx > 20 || o.vanishedAtStall > 0, `overshoot ${o.maxOvershootPx.toFixed(0)} px, gone ${o.vanishedAtStall}`)
 }

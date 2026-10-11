@@ -156,15 +156,19 @@ export function simulateVisualizer(timeline, tickSec, o = {}) {
     // --- the app ---
     let next = playing ? song + dtMs / 1000 : song
     const r = sess.step({ timeline, nowSec: next, startSec, endSec, noteMidi, nowMs: wall * 1000 })
-    const blocked = r.required.size > 0 && r.state !== 'satisfied' && r.overdue
-    if (blocked) { next = Math.min(next, r.holdAt); playing = false } else playing = true
+    // Mirrors Visualizer.jsx: late beyond the grace -> the sheet goes back to
+    // where the missed notes touch the keys and waits there until they're played.
+    const done = r.state === 'satisfied' || r.required.size === 0
+    let blocked = false
+    if (!playing) { if (done) playing = true; else blocked = true }
+    else if (!done && r.overdue) { blocked = true; playing = false; next = r.landSec }
     if (blocked && rawBlockStart === null) rawBlockStart = wall
     if (!blocked && rawBlockStart !== null) {
       const d = (wall - rawBlockStart) * 1000
       if (d < 120) { stats.shortStalls++; stats.shortStallMs += d }
       rawBlockStart = null
     }
-    const show = blocked && r.showWaiting
+    const show = blocked
     if (show && !showing) {
       stats.stallEpisodes++; stallStart = wall; if (r.missing.length === 0) stats.releaseBlocks++
       if (stats.diag.length < (o.diagN ?? 0)) {

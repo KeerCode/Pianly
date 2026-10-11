@@ -33,7 +33,10 @@
 export const GATE_DEFAULTS = {
   windowTicks: 15,       // entries this close together are one chord
   releaseGraceSec: 0.35, // a finished note may be held this much longer without counting as a stray key
-  earlyWindowSec: 0.15,  // a key for a note landing within this long is "early", not a stray key
+  earlyWindowSec: 0.3,   // a key for a note landing within this long is "early", not a stray key.
+                         // Must exceed lateGraceSec + a normal anticipation (~0.15 s): when the
+                         // page sends the sheet back to a missed note, keys already pressed for
+                         // the following notes would otherwise suddenly look like stray keys.
   waitUiMs: 0,           // extra debounce before showing "Waiting for…" (the grace already delays it)
   lateGraceSec: 0.12,    // how late past its landing a note may be played before the song waits
   simulWindowMs: 250,    // a chord's keys need not be down at the same instant: one pressed
