@@ -203,7 +203,7 @@ function simulate(timeline, bpm, gate, p = {}) {
 }
 
 let pass = 0, fail = 0
-const check = (name, ok, extra = '') => { ok ? pass++ : fail++; console.log(`  ${ok ? 'ok  ' : 'FAIL'} ${name}${extra ? '  — ' + extra : ''}`) }
+const check = (name, ok, extra = '') => { if (ok) pass++; else fail++; console.log(`  ${ok ? 'ok  ' : 'FAIL'} ${name}${extra ? '  — ' + extra : ''}`) }
 const row = (label, s) => console.log(`       ${label.padEnd(12)} interruptions ${String(s.stallEpisodes).padStart(3)} (${String(Math.round(s.stallMs)).padStart(6)} ms, player had to let go/replay ${String(s.adaptations).padStart(2)}x)  confirmed-without-a-press ${String(s.falseConfirms).padStart(3)}  bars-gone-when-paused ${String(s.vanishedAtStall).padStart(3)}  max overshoot ${s.maxOvershootPx.toFixed(0).padStart(3)} px  reached end ${s.confirmedAll}`)
 
 const PIECES = Object.entries(FIX).filter(([k]) => !k.startsWith('_')).map(([k, v]) => [k, toTimeline(v.entries), v.bpm])

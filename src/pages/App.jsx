@@ -6,14 +6,13 @@ import * as Tone from 'tone'
 import { SplendidGrandPiano } from 'smplr'
 import { DEMO_PIECES, loadDemoScore } from '../data/demoScores'
 import { noteNameToMidi, getInterval } from '../utils/noteConversion'
-import { getSavedFolder, pickFolder, listScores, loadScore } from '../lib/scoreFolder'
+import { getSavedFolder, pickFolder } from '../lib/scoreFolder'
 import { enableMidi, listenToDevice, notesMatch, onDevicesChanged } from '../input/midiInput'
 import { startBasicPitchDetection, loadBasicPitchModel, isBasicPitchReady } from '../input/pitchDetector'
 import { MidiStepGate } from '../practice/midiStepGate'
 import { parseNoteTimelineOSMD } from '../parsers/osmdParser'
 import { tickToSec } from '../parsers/parseTimeline'
 import Background from '../Background'
-import { useTheme } from '../ThemeContext'
 
 /** Unzip an MXL (ZIP) ArrayBuffer and return the inner MusicXML string. */
 function mxlToXml(buffer) {
@@ -96,11 +95,7 @@ function App() {
   const [showSheetPicker, setShowSheetPicker] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [showHomeSettings, setShowHomeSettings] = useState(false)
-  const [showLibrary, setShowLibrary] = useState(false)
-  const [libraryTab, setLibraryTab] = useState('mysongs')
   const [folderPath, setFolderPath] = useState(() => getSavedFolder())
-  const [folderScores, setFolderScores] = useState([])
-  const [folderLoading, setFolderLoading] = useState(false)
   const [showHint, setShowHint] = useState(false)
   const [bpm, setBpm] = useState(null)
   const [scoreBpm, setScoreBpm] = useState(null) // original tempo from the score
@@ -791,76 +786,11 @@ function App() {
     setMusicXml(data)
   }
 
-  // ── Library / folder handlers ────────────────────────────────────────────────
-  async function refreshFolder(path) {
-    if (!path) return
-    setFolderLoading(true)
-    try {
-      const scores = await listScores(path)
-      setFolderScores(scores)
-    } catch (e) {
-      console.error('[Library] listScores failed:', e)
-      setFolderScores([])
-    } finally {
-      setFolderLoading(false)
-    }
-  }
-
-  async function openLibrary() {
-    setShowLibrary(true)
-    if (folderPath) await refreshFolder(folderPath)
-  }
-
+  // ── Folder picker (home screen) ──────────────────────────────────────────────
   async function handlePickFolder() {
     const picked = await pickFolder()
     if (!picked) return
     setFolderPath(picked)
-    await refreshFolder(picked)
-  }
-
-  async function handleChangeFolder() {
-    const picked = await pickFolder()
-    if (!picked) return
-    setFolderPath(picked)
-    await refreshFolder(picked)
-  }
-
-  async function handleLoadFolderScore(score) {
-    setShowLibrary(false)
-    try {
-      const data = await loadScore(score)
-      setFilename(score.name.replace(/\.[^.]+$/, ''))
-      setMusicXml(data)
-    } catch (e) {
-      console.error('[Library] loadScore failed:', e)
-    }
-  }
-
-  async function handleOpenFolderScoreInVisualizer(score) {
-    try {
-      const data = await loadScore(score)
-      openInVisualizer(data, score.name.replace(/\.[^.]+$/, ''))
-    } catch (e) {
-      console.error('[Library] loadScore for visualizer failed:', e)
-    }
-  }
-
-  function openInVisualizer(data, name) {
-    // Pass song to Visualizer via sessionStorage then navigate
-    try {
-      if (data instanceof ArrayBuffer) {
-        // Store as base64 for ArrayBuffer
-        const bytes = new Uint8Array(data)
-        let bin = ''
-        bytes.forEach(b => { bin += String.fromCharCode(b) })
-        sessionStorage.setItem('nf-vis-song', JSON.stringify({ name, type: 'binary', data: btoa(bin) }))
-      } else {
-        sessionStorage.setItem('nf-vis-song', JSON.stringify({ name, type: 'text', data }))
-      }
-    } catch (e) {
-      console.error('openInVisualizer: sessionStorage failed', e)
-    }
-    window.location.hash = '/visualizer'
   }
 
   function handleBack() {
@@ -1224,25 +1154,6 @@ function App() {
     </svg>
   )
 
-  const { theme } = useTheme()
-
-  const LogoSvg = ({ size = 40, bg }) => (
-    <svg width={size} height={size} viewBox="0 0 72 72" fill="none" aria-label="Pianly logo">
-      <rect x="8" y="20" width="10" height="36" rx="2" fill="white" />
-      <rect x="20" y="20" width="10" height="36" rx="2" fill="white" />
-      <rect x="32" y="20" width="10" height="36" rx="2" fill="white" />
-      <rect x="44" y="20" width="10" height="36" rx="2" fill="white" />
-      <rect x="56" y="20" width="10" height="36" rx="2" fill="white" />
-      <rect x="15" y="20" width="8" height="22" rx="1.5" fill={bg} />
-      <rect x="27" y="20" width="8" height="22" rx="1.5" fill={bg} />
-      <rect x="47" y="20" width="8" height="22" rx="1.5" fill={bg} />
-      <rect x="59" y="20" width="8" height="22" rx="1.5" fill={bg} />
-      <circle cx="58" cy="14" r="4" fill="oklch(0.7 0.2 160)" />
-      <rect x="62" y="4" width="2.5" height="12" rx="1" fill="oklch(0.7 0.2 160)" />
-      <path d="M64.5 4 C64.5 4 70 6 70 9" stroke="oklch(0.7 0.2 160)" strokeWidth="2.5" strokeLinecap="round" />
-    </svg>
-  )
-
   return (
     <div className="h-screen overflow-hidden relative" style={{ background: 'var(--bg)', color: 'var(--ink)', fontFamily: "'Sora', sans-serif" }}>
       <Background />
@@ -1330,129 +1241,6 @@ function App() {
         onChange={handleFileChange}
         className="hidden"
       />
-
-      {/* ── Library Modal ─────────────────────────────────────────────────────── */}
-      {showLibrary && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4"
-          onClick={(e) => { if (e.target === e.currentTarget) setShowLibrary(false) }}>
-          <div className="rounded-2xl w-full max-w-lg max-h-[80vh] flex flex-col p-5 sm:p-6"
-            style={{ background: 'var(--panel)', border: '1px solid var(--border)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
-            <div className="flex items-center justify-between mb-4 shrink-0">
-              <h2 className="text-lg font-bold" style={{color:'var(--ink)'}}>Song Library</h2>
-              <button onClick={() => setShowLibrary(false)} style={{color:'var(--sub)'}} className="transition-colors cursor-pointer" aria-label="Close"
-                onMouseEnter={e=>e.currentTarget.style.color='var(--ink)'} onMouseLeave={e=>e.currentTarget.style.color='var(--sub)'}>
-                <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M15 5L5 15M5 5l10 10" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>
-              </button>
-            </div>
-            <div className="flex gap-1 mb-4 shrink-0 rounded-lg p-1" style={{background:'rgba(0,255,200,0.04)'}}>
-              {[['mysongs', 'My Scores'], ['demos', 'Demo Pieces']].map(([tab, label]) => (
-                <button key={tab} onClick={() => setLibraryTab(tab)}
-                  className="flex-1 py-1.5 rounded-md text-xs font-semibold transition-colors cursor-pointer"
-                  style={libraryTab === tab ? {background:'var(--accent)',color:'#000'} : {color:'var(--sub)'}}>
-                  {label}
-                </button>
-              ))}
-            </div>
-            <div className="flex-1 overflow-y-auto min-h-0">
-              {libraryTab === 'mysongs' && (
-                <div className="flex flex-col gap-2">
-                  {!folderPath ? (
-                    /* No folder selected yet */
-                    <div className="flex flex-col items-center gap-3 py-10 text-center">
-                      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" style={{color:'var(--sub)'}}><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
-                      <p className="text-sm" style={{color:'var(--sub)'}}>No scores folder set.<br/>Pick a folder containing your MusicXML files.</p>
-                      <button onClick={handlePickFolder}
-                        className="px-5 py-2.5 rounded-xl text-sm font-bold cursor-pointer"
-                        style={{background:'var(--accent)',color:'#000'}}>
-                        Choose Scores Folder
-                      </button>
-                    </div>
-                  ) : (
-                    <>
-                      {/* Folder header */}
-                      <div className="flex items-center justify-between mb-1 gap-2">
-                        <p className="text-xs truncate flex-1" style={{color:'var(--sub)'}} title={folderPath}>{folderPath}</p>
-                        <div className="flex gap-1 shrink-0">
-                          <button onClick={() => refreshFolder(folderPath)} title="Refresh"
-                            className="w-7 h-7 flex items-center justify-center rounded-lg transition-colors cursor-pointer"
-                            style={{color:'var(--sub)'}}
-                            onMouseEnter={e=>{e.currentTarget.style.color='var(--ink)';e.currentTarget.style.background='rgba(255,255,255,0.08)'}}
-                            onMouseLeave={e=>{e.currentTarget.style.color='var(--sub)';e.currentTarget.style.background='transparent'}}>
-                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 102.13-9.36L1 10"/></svg>
-                          </button>
-                          <button onClick={handleChangeFolder} title="Change Folder"
-                            className="px-2.5 py-1 rounded-lg text-xs transition-colors cursor-pointer"
-                            style={{border:'1px solid var(--border)',color:'var(--sub)'}}
-                            onMouseEnter={e=>e.currentTarget.style.color='var(--ink)'}
-                            onMouseLeave={e=>e.currentTarget.style.color='var(--sub)'}>
-                            Change
-                          </button>
-                        </div>
-                      </div>
-                      {/* Score list */}
-                      {folderLoading ? (
-                        <p className="text-sm text-center py-8" style={{color:'var(--sub)'}}>Scanning folder…</p>
-                      ) : folderScores.length === 0 ? (
-                        <p className="text-sm text-center py-8" style={{color:'var(--sub)'}}>No valid score files found (.xml, .musicxml, .mxl, .mid).</p>
-                      ) : folderScores.map(score => (
-                        <div key={score.path} className="flex items-center justify-between p-3 rounded-xl transition-colors"
-                          style={{border:'1px solid var(--border)'}}>
-                          <div className="min-w-0 mr-3">
-                            <div className="font-medium text-sm truncate" style={{color:'var(--ink)'}}>{score.name.replace(/\.[^.]+$/, '')}</div>
-                            <div className="text-xs mt-0.5" style={{color:'var(--sub)'}}>{score.name.split('.').pop().toUpperCase()}</div>
-                          </div>
-                          <div className="flex items-center gap-2 shrink-0">
-                            <button onClick={() => handleOpenFolderScoreInVisualizer(score)}
-                              title="Open in Visualizer"
-                              className="px-2.5 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer"
-                              style={{border:'1.5px solid var(--accent)',color:'var(--accent)'}}>
-                              Visualizer
-                            </button>
-                            <button onClick={() => handleLoadFolderScore(score)}
-                              className="px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer"
-                              style={{background:'var(--accent)',color:'#000'}}>
-                              Load
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </>
-                  )}
-                </div>
-              )}
-              {libraryTab === 'demos' && (
-                <div className="flex flex-col gap-2">
-                  {DEMO_PIECES.map(piece => (
-                    <div key={piece.id} className="flex items-center justify-between p-3 rounded-xl transition-colors"
-                      style={{border:'1px solid var(--border)'}}>
-                      <div className="min-w-0 mr-3">
-                        <div className="font-semibold text-sm truncate" style={{color:'var(--ink)'}}>{piece.title}</div>
-                        <div className="text-xs mt-0.5" style={{color:'var(--sub)'}}>{piece.composer}</div>
-                      </div>
-                      <div className="flex items-center gap-2 shrink-0">
-                        <span className="text-xs font-medium px-2 py-0.5 rounded-full" style={{background:'rgba(0,255,200,0.1)',color:'var(--ink)',border:'1px solid var(--border)'}}>
-                          {piece.difficulty}
-                        </span>
-                        <button onClick={async () => { const data = await loadDemoScore(piece); openInVisualizer(data, piece.title) }}
-                          title="Open in Visualizer"
-                          className="px-2.5 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer"
-                          style={{border:'1.5px solid var(--accent)',color:'var(--accent)'}}>
-                          Visualizer
-                        </button>
-                        <button onClick={() => { setShowLibrary(false); handleSelectDemo(piece) }}
-                          className="px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer"
-                          style={{background:'var(--accent)',color:'#000'}}>
-                          Load
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* ── Home Settings Modal ────────────────────────────────────────────── */}
       {showHomeSettings && (

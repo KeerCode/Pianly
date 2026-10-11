@@ -4,13 +4,11 @@ import { parseNoteTimeline, tickToSec as tempoMapTickToSec } from '../parsers/pa
 import { PracticeSession } from '../practice/practiceGate'
 import { parseMidiFile } from '../parsers/parseMidi'
 import { DEMO_PIECES, loadDemoScore } from '../data/demoScores'
-import { getSavedFolder, pickFolder, listScores, loadScore } from '../lib/scoreFolder'
 import { SplendidGrandPiano } from 'smplr'
 import { enableMidi } from '../input/midiInput'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import Background from '../Background'
-import { useTheme } from '../ThemeContext'
 import { midiToNoteName, noteNameToMidi } from '../utils/noteConversion'
 
 // ---------------------------------------------------------------------------
@@ -124,8 +122,6 @@ function getDefaultBpm() {
 }
 
 export default function Visualizer() {
-  const { theme } = useTheme()
-
   // ── Watch mode state ───────────────────────────────────────────────────────
   const [musicXml, setMusicXml] = useState(null)
   const [filename, setFilename] = useState('')
@@ -150,13 +146,6 @@ export default function Visualizer() {
   const [blockKind, setBlockKind] = useState('play')               // 'play' = notes still needed, 'release' = key to let go of
   const [midiDevices, setMidiDevices] = useState([])
   const [selectedDeviceId, setSelectedDeviceId] = useState(null)
-
-  // ── Library state ─────────────────────────────────────────────────────────
-  const [showLibrary, setShowLibrary] = useState(false)
-  const [libraryTab, setLibraryTab] = useState('mysongs') // 'mysongs' | 'demos'
-  const [folderPath, setFolderPath] = useState(() => getSavedFolder())
-  const [folderScores, setFolderScores] = useState([])
-  const [folderLoading, setFolderLoading] = useState(false)
 
   // ── Refs ──────────────────────────────────────────────────────────────────
   const canvasRef      = useRef(null)
@@ -496,12 +485,6 @@ export default function Visualizer() {
       }
     }
 
-    // Dev-only read-out of the song clock, so tools/paceSim-style players can
-    // follow the bars in a real run. Not present in production builds.
-    if (import.meta.env.DEV) {
-      window.__vizClock = { song: currentTimeSec - leadInSec, playing: ps.playing, waiting: practicePausedRef.current, speed, pinGroupTick }
-    }
-
     const activeKeys = {}
 
     if (ps.timeline && ps.timeline.length > 0) {
@@ -771,12 +754,6 @@ export default function Visualizer() {
     }
   }
 
-  function handleBack() {
-    handleStop()
-    synthRef.current?.close(); synthRef.current = null
-    setMusicXml(null); setFilename(''); setTimeline([])
-  }
-
   // ── Practice toggle ───────────────────────────────────────────────────────
   function handlePracticeToggle() {
     if (playing) handleStop()
@@ -810,52 +787,6 @@ export default function Visualizer() {
     setShowDemoModal(false); setFilename(piece.title); handleStop()
     const data = await loadDemoScore(piece)
     setMusicXml(data)
-  }
-
-  // ── Library handlers ──────────────────────────────────────────────────────
-  async function refreshFolder(path) {
-    if (!path) return
-    setFolderLoading(true)
-    try {
-      const scores = await listScores(path)
-      setFolderScores(scores)
-    } catch (e) {
-      console.error('[Library] listScores failed:', e)
-      setFolderScores([])
-    } finally {
-      setFolderLoading(false)
-    }
-  }
-
-  async function openLibrary() {
-    setShowLibrary(true)
-    if (folderPath) await refreshFolder(folderPath)
-  }
-
-  async function handlePickFolder() {
-    const picked = await pickFolder()
-    if (!picked) return
-    setFolderPath(picked)
-    await refreshFolder(picked)
-  }
-
-  async function handleChangeFolder() {
-    const picked = await pickFolder()
-    if (!picked) return
-    setFolderPath(picked)
-    await refreshFolder(picked)
-  }
-
-  async function handleLoadFolderScore(score) {
-    setShowLibrary(false)
-    try {
-      const data = await loadScore(score)
-      handleStop()
-      setFilename(score.name.replace(/\.[^.]+$/, ''))
-      setMusicXml(data)
-    } catch (e) {
-      console.error('[Library] loadScore failed:', e)
-    }
   }
 
   // Keep handlePlayRef current so the MIDI handler (captured in a closure) can call it
@@ -1157,112 +1088,6 @@ export default function Visualizer() {
         </div>
       )}
 
-      {/* ── Library modal ─────────────────────────────────────────────────── */}
-      {showLibrary && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4"
-          onClick={(e) => { if (e.target === e.currentTarget) setShowLibrary(false) }}>
-          <div className="rounded-2xl w-full max-w-lg max-h-[80vh] flex flex-col p-5 sm:p-6"
-            style={{ background: 'var(--panel)', border: '1px solid var(--border)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
-
-            {/* Header */}
-            <div className="flex items-center justify-between mb-4 shrink-0">
-              <h2 className="text-lg font-bold" style={{color:'var(--ink)'}}>Song Library</h2>
-              <button onClick={() => setShowLibrary(false)} className="hover:text-white transition-colors cursor-pointer" style={{color:'var(--sub)'}} aria-label="Close">
-                <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M15 5L5 15M5 5l10 10" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>
-              </button>
-            </div>
-
-            {/* Tabs */}
-            <div className="flex gap-1 mb-4 shrink-0 rounded-lg p-1" style={{background:'rgba(0,255,200,0.04)'}}>
-              {[['mysongs', 'My Scores'], ['demos', 'Demo Pieces']].map(([tab, label]) => (
-                <button key={tab} onClick={() => setLibraryTab(tab)}
-                  className="flex-1 py-1.5 rounded-md text-xs font-semibold transition-colors cursor-pointer"
-                  style={libraryTab === tab ? {background:'var(--accent)',color:'#000'} : {color:'var(--sub)'}}>
-                  {label}
-                </button>
-              ))}
-            </div>
-
-            {/* Content */}
-            <div className="flex-1 overflow-y-auto min-h-0">
-              {libraryTab === 'mysongs' && (
-                <div className="flex flex-col gap-2">
-                  {!folderPath ? (
-                    <div className="flex flex-col items-center gap-3 py-10 text-center">
-                      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" style={{color:'var(--sub)'}}><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
-                      <p className="text-sm" style={{color:'var(--sub)'}}>No scores folder set.<br/>Pick a folder containing your MusicXML files.</p>
-                      <button onClick={handlePickFolder}
-                        className="px-5 py-2.5 rounded-xl text-sm font-bold cursor-pointer"
-                        style={{background:'var(--accent)',color:'#000'}}>
-                        Choose Scores Folder
-                      </button>
-                    </div>
-                  ) : (
-                    <>
-                      <div className="flex items-center justify-between mb-1 gap-2">
-                        <p className="text-xs truncate flex-1" style={{color:'var(--sub)'}} title={folderPath}>{folderPath}</p>
-                        <div className="flex gap-1 shrink-0">
-                          <button onClick={() => refreshFolder(folderPath)} title="Refresh"
-                            className="w-7 h-7 flex items-center justify-center rounded-lg hover:text-white hover:bg-white/10 transition-colors cursor-pointer" style={{color:'var(--sub)'}}>
-                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 102.13-9.36L1 10"/></svg>
-                          </button>
-                          <button onClick={handleChangeFolder}
-                            className="px-2.5 py-1 rounded-lg text-xs hover:text-white transition-colors cursor-pointer"
-                            style={{border:'1px solid var(--border)',color:'var(--sub)'}}>
-                            Change
-                          </button>
-                        </div>
-                      </div>
-                      {folderLoading ? (
-                        <p className="text-sm text-center py-8" style={{color:'var(--sub)'}}>Scanning folder…</p>
-                      ) : folderScores.length === 0 ? (
-                        <p className="text-sm text-center py-8" style={{color:'var(--sub)'}}>No valid score files found (.xml, .musicxml, .mxl, .mid).</p>
-                      ) : folderScores.map(score => (
-                        <div key={score.path} className="flex items-center justify-between p-3 rounded-xl transition-colors" style={{border:'1px solid var(--border)'}}>
-                          <div className="min-w-0 mr-3">
-                            <div className="font-medium text-sm truncate" style={{color:'var(--ink)'}}>{score.name.replace(/\.[^.]+$/, '')}</div>
-                            <div className="text-xs mt-0.5" style={{color:'var(--sub)'}}>{score.name.split('.').pop().toUpperCase()}</div>
-                          </div>
-                          <div className="flex items-center gap-2 shrink-0">
-                            <button onClick={() => handleLoadFolderScore(score)}
-                              className="px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer"
-                              style={{background:'var(--accent)',color:'#000'}}>
-                              Load
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </>
-                  )}
-                </div>
-              )}
-
-              {libraryTab === 'demos' && (
-                <div className="flex flex-col gap-2">
-                  {DEMO_PIECES.map(piece => (
-                    <div key={piece.id} className="flex items-center justify-between p-3 rounded-xl transition-colors" style={{border:'1px solid var(--border)'}}>
-                      <div className="min-w-0 mr-3">
-                        <div className="font-semibold text-sm truncate" style={{color:'var(--ink)'}}>{piece.title}</div>
-                        <div className="text-xs mt-0.5" style={{color:'var(--sub)'}}>{piece.composer}</div>
-                      </div>
-                      <div className="flex items-center gap-2 shrink-0">
-                        <span className="text-xs font-medium px-2 py-0.5 rounded-full" style={{background:'rgba(0,255,200,0.1)',color:'var(--ink)',border:'1px solid var(--border)'}}>
-                          {piece.difficulty}
-                        </span>
-                        <button onClick={() => { setShowLibrary(false); handleSelectDemo(piece) }}
-                          className="px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer"
-                          style={{background:'var(--accent)',color:'#000'}}>
-                          Load
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   )
 }

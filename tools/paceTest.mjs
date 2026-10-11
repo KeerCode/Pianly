@@ -15,7 +15,7 @@ import { simulateSheet, simulateVisualizer, legacySheet, newSheet } from './pace
 
 const FIX = JSON.parse(readFileSync(fileURLToPath(new URL('./fixtures/practice-timelines.json', import.meta.url)), 'utf8'))
 let pass = 0, fail = 0
-const check = (name, ok, extra = '') => { ok ? pass++ : fail++; console.log(`  ${ok ? 'ok  ' : 'FAIL'} ${name}${extra ? '  — ' + extra : ''}`) }
+const check = (name, ok, extra = '') => { if (ok) pass++; else fail++; console.log(`  ${ok ? 'ok  ' : 'FAIL'} ${name}${extra ? '  — ' + extra : ''}`) }
 
 // ---- Sheet Practice (MIDI) ---------------------------------------------------------
 const NAMES = ['C', 'D', 'E', 'F', 'G', 'A', 'B']

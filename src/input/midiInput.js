@@ -32,12 +32,6 @@ export async function enableMidi() {
   }
 }
 
-export function getInputs() {
-  // Re-query synchronously is not possible with Tauri commands;
-  // use enableMidi() to refresh the list instead.
-  return []
-}
-
 let unlistenOn = null
 let unlistenOff = null
 
