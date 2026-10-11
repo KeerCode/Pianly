@@ -15,7 +15,7 @@
  * hesitation.
  */
 import { PracticeSession } from '../src/practice/practiceGate.js'
-import { MidiStepGate } from '../src/practice/midiStepGate.js'
+import { StepGate } from '../src/practice/stepGate.js'
 
 // ---- deterministic RNG ---------------------------------------------------------
 export function rng(seed = 1) {
@@ -249,35 +249,43 @@ export function legacySheet() {
 }
 
 /**
- * The Sheet Practice MIDI path AFTER this change: same MidiStepGate the page
- * uses, advance the moment a step is complete, no cooldown, no wait-for-release.
+ * Sheet Practice as it is now (App.jsx): the same StepGate the page uses. A step
+ * completes once each of its notes has been pressed; the cursor then waits out
+ * the step's written time (to the next step) from that moment before moving on.
+ * Notes of the next step played during the wait count when the cursor arrives.
  */
 export function newSheet() {
-  const gate = new MidiStepGate((a, b) => notesMatch(a, b))
-  const st = { idx: 0, wrong: 0, pendingIdx: null, pendingAt: 0 }
+  const gate = new StepGate((a, b) => notesMatch(a, b))
+  const st = { idx: 0, wrong: 0, wait: null, completedAt: [] }
+  const startWait = (entries, at) => {
+    const cur = entries[st.idx], next = entries[st.idx + 1]
+    st.completedAt[st.idx] = at
+    if (!next) { st.idx = entries.length; return }
+    st.wait = { due: at + (next.timeSec - cur.timeSec) }
+  }
   return {
     st,
-    held: gate.held,
-    tick(t) { if (st.pendingIdx != null && t >= st.pendingAt) { st.idx = st.pendingIdx; st.pendingIdx = null } },
-    noteOn(name, t, entries) { gate.noteOn(name, t * 1000); this.check(t, entries) },
-    noteOff(name, t, entries) { gate.noteOff(name, t * 1000); this.check(t, entries) }, // letting go of a stray key can complete a step
-    check(t, entries) {
-      for (let guard = 0; guard < 8; guard++) {
+    tick(t, entries) {
+      for (let guard = 0; guard < 4 && st.wait && t >= st.wait.due; guard++) {
+        st.wait = null
+        gate.advance()
+        st.idx++
         const target = entries[st.idx]
         if (!target) return
-        const r = gate.evaluate(target.notes, false, entries[st.idx + 1]?.notes ?? null, t * 1000)
-        if (r === 'wrong') { st.wrong++; return }
-        if (r !== 'complete') return
-        // No tie skipping: the OSMD timeline already omits tie continuations, so the
-        // entry after a tied one is a real step (skipping it jumped over chords).
-        const n = st.idx + 1
-        if (n >= entries.length) { st.idx = entries.length; return }
-        const prev = entries[st.idx], next = entries[n]
-        const gapMs = Math.max(0, (next.timeSec - (prev.timeSec + prev.durationSec)) * 1000)
-        if (gapMs >= 400 && (next.measure - prev.measure) > 1) { st.pendingIdx = n; st.pendingAt = t + gapMs / 1000; return }
-        st.idx = n // keys already down for the next step are judged straight away
+        const r = gate.check(target.notes)
+        if (r.complete) startWait(entries, r.at != null ? r.at / 1000 : t)
       }
     },
+    noteOn(name, t, entries) {
+      const target = entries[st.idx]
+      if (!target) return
+      const next = entries[st.idx + 1]
+      if (st.wait) { gate.pressDuringWait(name, next?.notes, false, t * 1000); return }
+      const r = gate.press(name, target.notes, next?.notes, false, t * 1000)
+      if (r === 'wrong') st.wrong++
+      if (r === 'complete') startWait(entries, t)
+    },
+    noteOff() {},
     get index() { return st.idx },
   }
 }
@@ -322,6 +330,26 @@ export function simulateSheet(entries, makeLogic, o = {}) {
   stats.p90LagMs = lags.length ? Math.round(lags[Math.floor(lags.length * 0.9)]) : null
   stats.maxLagSec = lags.length ? Math.round(lags[lags.length - 1]) / 1000 : null
   stats.lateEntries = lags.filter((l) => l > 250).length
+  // For the timed logic: the cursor arrives at step i when step i-1's time is up.
+  // `arrivalVsPlayerMs`: arrival minus the moment the player started step i
+  // (around zero = the cursor keeps up with a player at tempo; no drift).
+  // `shortestHoldMs`: min over steps of (time the cursor left it - written step
+  // time - when it was completed); negative would mean a step was cut short.
+  const done = logic.st?.completedAt
+  if (done) {
+    const arr = []
+    let shortest = Infinity
+    for (let i = 1; i < entries.length; i++) {
+      if (advancedAt[i - 1] == null || playedAt[i] == null) continue
+      arr.push((advancedAt[i - 1] - playedAt[i]) * 1000)
+      if (done[i - 1] != null) shortest = Math.min(shortest, (advancedAt[i - 1] - done[i - 1] - (entries[i].timeSec - entries[i - 1].timeSec)) * 1000)
+    }
+    arr.sort((a, b) => a - b)
+    stats.arrivalVsPlayerMs = arr.length ? { median: Math.round(arr[arr.length >> 1]), p95: Math.round(arr[Math.floor(arr.length * 0.95)]), max: Math.round(arr[arr.length - 1]) } : null
+    stats.shortestHoldMs = Number.isFinite(shortest) ? Math.round(shortest) : null
+    const last = entries.length - 1
+    stats.endDriftMs = advancedAt[last - 1] != null && playedAt[last] != null ? Math.round((advancedAt[last - 1] - playedAt[last]) * 1000) : null
+  }
   // first entry the cursor never got past while the player had long moved on
   for (let i = 0; i < entries.length; i++) if (advancedAt[i] == null) { stats.stuckAt = i; break }
   stats.neverAdvanced = entries.length - stats.advanced

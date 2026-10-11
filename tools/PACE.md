@@ -14,33 +14,32 @@ against the real parsers, and then driving the real pages in real time with
 injected MIDI (Tauri's event bridge stubbed). Maple Leaf Rag: 177.3 s, 1,026
 steps in Sheet Practice, 1,372 in the Visualizer.
 
-## Sheet Practice (MIDI)
+## Sheet Practice
 
-| | before | after |
+The rule (`src/practice/stepGate.js`, `App.jsx`), for MIDI and the mic alike:
+
+* A step is complete once every one of its notes has been **pressed at least
+  once**. Holding is not required and a chord does not have to go down at once.
+* The cursor then stays on the step for its **written time** (the time to the
+  next step at the current BPM), counted from the moment it was completed, and
+  moves on by itself. Letting go early changes nothing. Rests are included.
+* Notes of the **next** step played during that wait count as soon as the cursor
+  arrives, and that step's own time is counted from when they were played, so a
+  player at tempo is never held back or left behind.
+* A note in neither this step nor the next is a wrong note: the step's progress
+  resets and the hint logic counts it. Holding a key never counts as playing it
+  again. Pause freezes the wait; restart and manual navigation cancel it.
+* Mic (Basic Pitch): a note counts as pressed when it first appears in the
+  detector's output; a note that is still ringing is not pressed again.
+
+| Maple Leaf Rag, player at the written tempo | before (released-keys rule) | now |
 |---|---|---|
-| steps advanced (player at the written tempo) | **4 of 1026**, 2,563 wrong-note flags | **1026 of 1026**, 0 flags |
-| lag behind the key press (median / worst) | 27 s / never | 13 ms / 59 ms |
-| a very sloppy player (hands 45 ms apart, 30 ms jitter, 4% hesitations) | wedged | 1026 of 1026, 34 ms median |
-| real page, real time | | finished in 177.7 s, never more than one step behind, no hints |
+| steps advanced (simulated, 1026) | 4, 2,563 wrong-note flags | 1026, none |
+| real page, real time (first 45 s, 260 steps) | | all 260; cursor reaches each step 25 ms (median) after the player starts it, 73 ms worst |
+| a step left before its written time | | never (shortest: exactly the written time) |
 
-What was wrong (`src/practice/midiStepGate.js`, `App.jsx`):
-
-* A step only completed once **every key was released**. Piano music overlaps, so
-  the held set almost never emptied and the song wedged after a few notes.
-* Any key still down that was not in the current step was a **wrong note**, so a
-  held bass note was wrong all the time.
-* A 150 ms cooldown after each advance **dropped** the next note-on when it
-  arrived inside it (a sixteenth at 100 bpm is exactly 150 ms).
-* After a step containing a tied note, `doAdvance` **skipped the next step**. It
-  assumed tie continuations were separate steps, but the OSMD parser drops them,
-  so the skipped step was a real chord (the player was asked for notes later
-  than the cursor showed).
-* A short note released before the rest of its chord arrived was never seen.
-
-Now a step completes the moment its notes are down; keys held at that moment are
-"old" until let go (not wrong, and cannot satisfy a later step by being held); a
-key of the *next* step pressed slightly early is early, not wrong; a key released
-within 250 ms still counts toward a chord; letting go of a stray key re-checks.
+Also fixed on the way: two overlapping MIDI connects left the first listener
+registered, so every note arrived twice (`listenToDevice` now serialises).
 
 ## Visualizer (wait mode)
 
@@ -64,6 +63,6 @@ keys. See `src/practice/practiceGate.js`.
 * `lateGraceSec` trades responsiveness for pace: bigger = fewer waits, but a
   note can be that much later before the song stops and bars scroll that far
   past (24 px at 0.12 s) first.
-* Sheet Practice has no clock, so a wrong key is still judged strictly: a key
-  that was never part of an accepted step flags wrong until it is let go.
+* Sheet Practice does not judge rhythm: playing the next note early is accepted
+  (each note still gets its written time from when it was played).
 * Mic input (Basic Pitch) is not simulated here; these numbers are for MIDI.

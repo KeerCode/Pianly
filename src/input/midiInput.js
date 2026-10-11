@@ -35,7 +35,17 @@ export async function enableMidi() {
 let unlistenOn = null
 let unlistenOff = null
 
-export async function listenToDevice(deviceId, onNote, onNoteOff) {
+// Calls are serialised: two overlapping calls (practice start and the device
+// effect both connect) used to interleave, so the first one's listeners were
+// never removed and every note arrived twice.
+let listenChain = Promise.resolve()
+export function listenToDevice(deviceId, onNote, onNoteOff) {
+  const run = listenChain.then(() => connectDevice(deviceId, onNote, onNoteOff))
+  listenChain = run.catch(() => {})
+  return run
+}
+
+async function connectDevice(deviceId, onNote, onNoteOff) {
   // Disconnect previous
   if (unlistenOn) { unlistenOn(); unlistenOn = null }
   if (unlistenOff) { unlistenOff(); unlistenOff = null }

@@ -1,7 +1,8 @@
 /**
  * Pace regression: does each practice mode keep up with a person playing at the
- * written tempo? Synthetic ragtime-like patterns for Sheet Practice (MIDI), and
- * real demo-score excerpts for the Visualizer. No samples or DOM needed.
+ * written tempo? Synthetic ragtime-like patterns for Sheet Practice (MIDI) -
+ * including that a step is never left before its written time is up - and real
+ * demo-score excerpts for the Visualizer. No samples or DOM needed.
  *
  *   npm run test:pace
  *
@@ -46,21 +47,28 @@ const B = merge(Array.from({ length: 80 }, (_, k) => mk(k * 0.15, 0.13, ['E4']))
 // C: tied notes in the middle of a run: the OSMD timeline has NO entry for the tie continuation
 const C = merge(Array.from({ length: 60 }, (_, k) => mk(k * 0.3, 0.25, [`${NAMES[k % 7]}4`], 1 + Math.floor(k / 8), k % 5 === 2)))
 
-const row = (r) => `advanced ${String(r.advanced).padStart(4)}/${r.entries}  wrong ${String(r.wrong).padStart(5)}  median lag ${r.medianLagMs ?? '-'} ms`
-console.log('Sheet Practice, MIDI, player at the written tempo')
-for (const [label, entries, strong] of [['oom-pah under 16ths', A, true], ['repeated 16th notes', B, true], ['tied notes mid-run', C, false]]) {
+const row = (r) => `advanced ${String(r.advanced).padStart(4)}/${r.entries}  wrong ${String(r.wrong).padStart(5)}`
+  + (r.arrivalVsPlayerMs ? `  cursor vs player ${r.arrivalVsPlayerMs.median} ms (p95 ${r.arrivalVsPlayerMs.p95})  shortest step ${r.shortestHoldMs} ms over written` : '')
+const keepsUp = (r) => r.advanced === r.entries && r.wrong === 0
+  && Math.abs(r.arrivalVsPlayerMs.median) <= 60 && r.arrivalVsPlayerMs.p95 <= 150 && Math.abs(r.endDriftMs) <= 300
+console.log('Sheet Practice (MIDI): each step lasts its written time from when it is played')
+for (const [label, entries] of [['oom-pah under 16ths', A], ['repeated 16th notes', B], ['tied notes mid-run', C]]) {
   const o = simulateSheet(entries, legacySheet, { seed: 4 })
   const n = simulateSheet(entries, newSheet, { seed: 4 })
   console.log(`   ${label.padEnd(22)} old: ${row(o)}\n   ${''.padEnd(22)} new: ${row(n)}`)
-  check(`${label}: new logic plays the whole pattern, no wrong-note flags`, n.advanced === n.entries && n.wrong === 0, `${n.advanced}/${n.entries}, ${n.wrong} wrong`)
-  check(`${label}: and stays within 150 ms of the player (p90)`, (n.p90LagMs ?? 9e9) <= 150, `p90 ${n.p90LagMs} ms`)
-  if (strong) check(`${label}: old logic could not keep up (reproduced)`, o.advanced < o.entries, `${o.advanced}/${o.entries}`)
+  check(`${label}: plays through and the cursor keeps up with a player at tempo (no drift)`, keepsUp(n),
+    `${n.advanced}/${n.entries}, ${n.wrong} wrong, median ${n.arrivalVsPlayerMs?.median} ms, end drift ${n.endDriftMs} ms`)
+  check(`${label}: never moves on before a step's written time is up`, n.shortestHoldMs >= -5, `${n.shortestHoldMs} ms`)
+  check(`${label}: old logic could not keep up (reproduced)`, o.advanced < o.entries, `${o.advanced}/${o.entries}`)
 }
 {
-  const sloppy = { seed: 8, noteJitterMs: 30, tempoWobbleMs: 14, chordSpreadMs: 45, hesitationP: 0.04 }
-  const n = simulateSheet(A, newSheet, sloppy)
-  console.log(`   ${'oom-pah, very sloppy'.padEnd(22)} new: ${row(n)}`)
-  check('very sloppy hands (45 ms apart, 30 ms jitter, 4% hesitations) still get all the way through', n.advanced === n.entries && n.wrong === 0, `${n.advanced}/${n.entries}`)
+  const taps = simulateSheet(A, newSheet, { seed: 5, holdMin: 0.1, holdMax: 0.2 })
+  console.log(`   ${'quick taps'.padEnd(22)} new: ${row(taps)}`)
+  check('letting go straight away still moves on, on time', keepsUp(taps) && taps.shortestHoldMs >= -5)
+  const sloppy = simulateSheet(A, newSheet, { seed: 8, noteJitterMs: 30, tempoWobbleMs: 14, chordSpreadMs: 45, hesitationP: 0.04 })
+  console.log(`   ${'very sloppy'.padEnd(22)} new: ${row(sloppy)}`)
+  check('very sloppy hands (45 ms apart, 30 ms jitter, 4% hesitations) still get all the way through',
+    sloppy.advanced === sloppy.entries && sloppy.wrong === 0 && sloppy.shortestHoldMs >= -5)
 }
 
 // ---- Visualizer -----------------------------------------------------------------------

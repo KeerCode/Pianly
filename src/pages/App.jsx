@@ -9,7 +9,7 @@ import { noteNameToMidi, getInterval } from '../utils/noteConversion'
 import { getSavedFolder, pickFolder } from '../lib/scoreFolder'
 import { enableMidi, listenToDevice, notesMatch, onDevicesChanged } from '../input/midiInput'
 import { startBasicPitchDetection, loadBasicPitchModel, isBasicPitchReady } from '../input/pitchDetector'
-import { MidiStepGate } from '../practice/midiStepGate'
+import { StepGate } from '../practice/stepGate'
 import { parseNoteTimelineOSMD } from '../parsers/osmdParser'
 import { tickToSec } from '../parsers/parseTimeline'
 import Background from '../Background'
@@ -148,12 +148,14 @@ function App() {
   const anyOctaveRef = useRef(false)
   const modeRef = useRef('idle')
   const heldNotesRef = useRef(new Set())
-  const waitingForReleaseRef = useRef(false) // true = correct note played, waiting for release to advance
-  // MIDI step gate: which keys count for the current step, which are left over
-  // from steps already accepted (see src/practice/midiStepGate.js).
-  const midiGateRef = useRef(null)
-  if (midiGateRef.current === null) midiGateRef.current = new MidiStepGate((a, b, any) => notesMatch(a, b, any))
-  const inputModeRef = useRef('midi')
+  // Which notes of the current step have been played, and notes played early for
+  // the next one (see src/practice/stepGate.js). Shared by MIDI and the mic.
+  const stepGateRef = useRef(null)
+  if (stepGateRef.current === null) stepGateRef.current = new StepGate((a, b, any) => notesMatch(a, b, any))
+  // A completed step waits out its written time before the cursor moves:
+  // { timer, idx, due } while waiting, { idx, remaining } while paused, else null.
+  const stepWaitRef = useRef(null)
+  const micHeardRef = useRef(new Set()) // notes the mic reported last time (a note "is pressed" when it first appears)
   const wrongCountRef = useRef(0) // counts wrong attempts for current note
   const lastTickSetRef = useRef(-1)
   const autoscrollRef = useRef(true)
@@ -165,7 +167,6 @@ function App() {
   useEffect(() => { pausedRef.current = paused }, [paused])
   useEffect(() => { anyOctaveRef.current = anyOctave }, [anyOctave])
   useEffect(() => { modeRef.current = mode }, [mode])
-  useEffect(() => { inputModeRef.current = inputMode }, [inputMode])
   useEffect(() => { autoscrollRef.current = autoscroll }, [autoscroll])
   useEffect(() => { playbackSpeedRef.current = playbackSpeed }, [playbackSpeed])
   useEffect(() => { localStorage.setItem('nf-input', inputMode) }, [inputMode])
@@ -536,43 +537,19 @@ function App() {
   // Practice mode: advance on correct input
   // ---------------------------------------------------------------------------
 
-  // Advance to the next note
+  // Move the cursor to the next step (or finish). Called when a step's written
+  // time is up — see startStepWait.
   const doAdvance = useCallback(() => {
-    // No re-trigger cooldown: once a step is accepted its keys count as old
-    // until let go (MidiStepGate), so one press can't advance twice. The old
-    // 150 ms cooldown silently dropped the next note when it arrived inside it.
-    // No tie skipping either: the parser already drops tie continuations, so the
-    // entry after a tied one is a real step (skipping it jumped over chords).
     const nextIdx = currentNoteIndexRef.current + 1
-    const tl = noteTimelineRef.current
-
-    if (nextIdx >= tl.length) {
+    if (nextIdx >= noteTimelineRef.current.length) {
       setCompleted(true)
-    } else {
-      wrongCountRef.current = 0
-      setShowHint(false)
-      clearTimeout(wrongTimerRef.current)
-      wrongTimerRef.current = null
-
-      // If there's a significant time gap before the next note (i.e. a measure rest),
-      // wait that duration before advancing — cursor stays on the current note.
-      const prevEntry = tl[currentNoteIndexRef.current]
-      const nextEntry = tl[nextIdx]
-      const prevEnd = (prevEntry?.timeSec ?? 0) + (prevEntry?.durationSec ?? 0)
-      const gapMs = Math.max(0, ((nextEntry?.timeSec ?? 0) - prevEnd) * 1000)
-      const REST_THRESHOLD_MS = 400 // gaps shorter than this are notation artifacts, not rests
-
-      // Only wait if there is at least one completely empty measure between the two entries
-      // (i.e. both hands rest for an entire bar). If the next note is in the immediately
-      // following measure, the gap is just the tail of the current bar after its last note —
-      // a whole rest on the other hand doesn't mean pause; advance immediately.
-      const measuresSkipped = (nextEntry?.measure ?? 1) - (prevEntry?.measure ?? 1)
-      if (gapMs >= REST_THRESHOLD_MS && measuresSkipped > 1) {
-        setTimeout(() => setCurrentNoteIndex(nextIdx), gapMs)
-      } else {
-        setCurrentNoteIndex(nextIdx)
-      }
+      return
     }
+    wrongCountRef.current = 0
+    setShowHint(false)
+    clearTimeout(wrongTimerRef.current)
+    wrongTimerRef.current = null
+    setCurrentNoteIndex(nextIdx)
   }, [])
 
   // Play the target note(s) via SplendidGrandPiano as a hint
@@ -589,71 +566,65 @@ function App() {
     })
   }, [])
 
-  // Called when notes are detected (MIDI noteOn or mic detection)
-  const checkNotes = useCallback(() => {
+  // ---- Step timing ---------------------------------------------------------
+  // Once every note of a step has been played, the cursor stays on it until the
+  // step's written time is up (the time to the next step, at the current BPM),
+  // counted from the moment it was completed. Letting go early doesn't matter.
+  const scheduleStepWait = useCallback((idx, due) => {
+    const timer = setTimeout(() => {
+      // A stale wait (the cursor was moved by hand, or practice stopped) does nothing.
+      if (stepWaitRef.current?.timer !== timer || currentNoteIndexRef.current !== idx) return
+      stepWaitRef.current = null
+      stepGateRef.current.advance()
+      doAdvance()
+    }, Math.max(0, due - performance.now()))
+    stepWaitRef.current = { timer, idx, due }
+  }, [doAdvance])
+
+  const startStepWait = useCallback((idx, completedAt) => {
+    const tl = noteTimelineRef.current
+    const cur = tl[idx]
+    const next = tl[idx + 1]
+    if (!next) { doAdvance(); return } // last step: done
+    const stepMs = Math.max(0, ((next.timeSec ?? 0) - (cur?.timeSec ?? 0)) * 1000)
+    scheduleStepWait(idx, completedAt + stepMs)
+  }, [doAdvance, scheduleStepWait])
+
+  const resetStepState = () => {
+    if (stepWaitRef.current?.timer) clearTimeout(stepWaitRef.current.timer)
+    stepWaitRef.current = null
+    stepGateRef.current.reset()
+    micHeardRef.current = new Set()
+  }
+
+  // A key press (MIDI note-on, or a note newly heard by the mic).
+  const handlePress = useCallback((name) => {
     if (completedRef.current || pausedRef.current) return
     if (modeRef.current !== 'practice') return
-
+    const tl = noteTimelineRef.current
     const idx = currentNoteIndexRef.current
-    const target = noteTimelineRef.current[idx]
+    const target = tl[idx]
     if (!target) return
+    const next = tl[idx + 1]
+    const anyOct = anyOctaveRef.current
+    const now = performance.now()
 
-    if (inputModeRef.current === 'midi') {
-      const next = noteTimelineRef.current[idx + 1]
-      const r = midiGateRef.current.evaluate(target.notes, anyOctaveRef.current, next?.notes ?? null, performance.now())
-      if (r === 'complete') {
-        clearTimeout(wrongTimerRef.current)
-        wrongTimerRef.current = null
-        setShowHint(false)
-        wrongCountRef.current = 0
-        doAdvance()
-      } else if (r === 'wrong') {
-        wrongCountRef.current++
-        if (wrongCountRef.current >= MAX_WRONG_ATTEMPTS) {
-          setShowHint(true)
-          playTargetHint()
-          wrongCountRef.current = 0
-        } else if (!wrongTimerRef.current) {
-          wrongTimerRef.current = setTimeout(() => {
-            wrongTimerRef.current = null
-            setShowHint(true)
-          }, HINT_DELAY_MS)
-        }
-      }
+    // The current step is done and waiting out its time: only notes of the next
+    // step matter, and they count as soon as the cursor gets there.
+    if (stepWaitRef.current) {
+      stepGateRef.current.pressDuringWait(name, next?.notes, anyOct, now)
       return
     }
 
-    const targetNotes = target.notes
-    const anyOct = anyOctaveRef.current
-    const held = [...heldNotesRef.current]
-
-    if (held.length === 0) return
-
-    // Check: every target note is held
-    const allTargetsHeld = targetNotes.every((tn) =>
-      held.some((h) => notesMatch(h, tn, anyOct))
-    )
-
-    // Check: no extra notes beyond the target
-    const noExtras = held.every((h) =>
-      targetNotes.some((tn) => notesMatch(h, tn, anyOct))
-    )
-
-    if (allTargetsHeld && noExtras) {
-      // Correct — wait for release before advancing
-      waitingForReleaseRef.current = true
+    const r = stepGateRef.current.press(name, target.notes, next?.notes, anyOct, now)
+    if (r === 'complete') {
       clearTimeout(wrongTimerRef.current)
       wrongTimerRef.current = null
       setShowHint(false)
       wrongCountRef.current = 0
-    } else if (noExtras && !allTargetsHeld) {
-      // User is still building the chord — all held notes are valid targets,
-      // just not all of them pressed yet. Don't penalize, just wait.
-    } else {
-      // Wrong note(s) played — at least one held note is not in the target
-      waitingForReleaseRef.current = false
+      startStepWait(idx, now)
+    } else if (r === 'wrong') {
       wrongCountRef.current++
-
       if (wrongCountRef.current >= MAX_WRONG_ATTEMPTS) {
         // Play the target note as a hint
         setShowHint(true)
@@ -666,33 +637,21 @@ function App() {
         }, HINT_DELAY_MS)
       }
     }
-  }, [playTargetHint, doAdvance])
-
-  // Called when all notes are released
-  const handleRelease = useCallback(() => {
-    if (waitingForReleaseRef.current) {
-      waitingForReleaseRef.current = false
-      doAdvance()
-    }
-  }, [doAdvance])
+  }, [playTargetHint, startStepWait])
 
   const handleNoteOff = useCallback((note) => {
-    midiGateRef.current.noteOff(note, performance.now())
     heldNotesRef.current.delete(note)
-    if (heldNotesRef.current.size === 0) {
-      setDetectedNote(null)
-      handleRelease()
-    } else {
-      setDetectedNote([...heldNotesRef.current].join(' + '))
-    }
-    // Letting go of a stray key (or a chord note) can be what completes a step.
-    if (inputModeRef.current === 'midi') checkNotes()
-  }, [handleRelease, checkNotes])
+    setDetectedNote(heldNotesRef.current.size ? [...heldNotesRef.current].join(' + ') : null)
+  }, [])
 
-  // The cursor moved: keys already down for the new step (played a little early)
-  // are judged straight away instead of waiting for the next key event.
+  // The cursor moved on: notes of this step that were played early may already
+  // complete it, in which case its wait starts from when they were played.
   useEffect(() => {
-    if (mode === 'practice' && inputMode === 'midi') checkNotes()
+    if (mode !== 'practice' || stepWaitRef.current) return
+    const target = noteTimelineRef.current[currentNoteIndex]
+    if (!target) return
+    const r = stepGateRef.current.check(target.notes)
+    if (r.complete) startStepWait(currentNoteIndex, r.at ?? performance.now())
   }, [currentNoteIndex]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Auto-reconnect MIDI when device changes mid-practice
@@ -707,10 +666,9 @@ function App() {
       const stop = await listenToDevice(
         selectedDeviceId,
         (note) => {
-          midiGateRef.current.noteOn(note, performance.now())
           heldNotesRef.current.add(note)
           setDetectedNote([...heldNotesRef.current].join(' + '))
-          checkNotes()
+          handlePress(note)
         },
         handleNoteOff,
       )
@@ -722,7 +680,7 @@ function App() {
     })()
 
     return () => { cancelled = true }
-  }, [selectedDeviceId, mode, inputMode, checkNotes, handleNoteOff])
+  }, [selectedDeviceId, mode, inputMode, handlePress, handleNoteOff])
 
   // Cleanup on unmount
   useEffect(() => {
@@ -748,7 +706,7 @@ function App() {
     clearTimeout(wrongTimerRef.current)
     wrongTimerRef.current = null
     heldNotesRef.current.clear()
-    midiGateRef.current.clear()
+    resetStepState()
     stopToneListenLoop()
     Tone.getTransport().stop()
     Tone.getTransport().cancel()
@@ -1008,7 +966,7 @@ function App() {
     setShowHint(false)
     setMode('practice')
     lastTickSetRef.current = -1
-    midiGateRef.current.clear()
+    resetStepState()
 
     if (inputMode === 'midi') {
       if (!selectedDeviceId) {
@@ -1023,10 +981,9 @@ function App() {
       const stop = await listenToDevice(
         selectedDeviceId,
         (note) => {
-          midiGateRef.current.noteOn(note, performance.now())
           heldNotesRef.current.add(note)
           setDetectedNote([...heldNotesRef.current].join(' + '))
-          checkNotes()
+          handlePress(note)
         },
         handleNoteOff,
       )
@@ -1039,17 +996,13 @@ function App() {
     } else {
       try {
         const onNotes = (notes) => {
-          if (notes && notes.length > 0) {
-            heldNotesRef.current.clear()
-            for (const n of notes) heldNotesRef.current.add(n)
-            setDetectedNote(notes.join(' + '))
-            checkNotes()
-          } else {
-            // All notes released — trigger release logic
-            heldNotesRef.current.clear()
-            setDetectedNote(null)
-            handleRelease()
-          }
+          const heard = new Set(notes ?? [])
+          heldNotesRef.current = heard
+          setDetectedNote(heard.size ? [...heard].join(' + ') : null)
+          // A note that is still ringing is not played again; one that has just
+          // appeared is a new press.
+          for (const n of heard) if (!micHeardRef.current.has(n)) handlePress(n)
+          micHeardRef.current = heard
         }
         const stop = await startBasicPitchDetection(onNotes)
         stopMicRef.current = stop
@@ -1075,6 +1028,11 @@ function App() {
   }
 
   function handlePausePractice() {
+    const w = stepWaitRef.current
+    if (w?.timer) {
+      clearTimeout(w.timer)
+      stepWaitRef.current = { idx: w.idx, remaining: Math.max(0, w.due - performance.now()) }
+    }
     setPaused(true)
     clearTimeout(wrongTimerRef.current)
     wrongTimerRef.current = null
@@ -1082,10 +1040,13 @@ function App() {
   }
 
   function handleResumePractice() {
+    const w = stepWaitRef.current
+    if (w && !w.timer) scheduleStepWait(w.idx, performance.now() + w.remaining)
     setPaused(false)
   }
 
   function handleRestart() {
+    resetStepState()
     setCompleted(false)
     setCurrentNoteIndex(0)
     setDetectedNote(null)
@@ -1099,11 +1060,13 @@ function App() {
   // Navigation
   function handlePrevMoment() {
     lastTickSetRef.current = -1
+    resetStepState()
     setCurrentNoteIndex((i) => Math.max(0, i - 1))
   }
 
   function handleNextMoment() {
     lastTickSetRef.current = -1
+    resetStepState()
     setCurrentNoteIndex((i) => Math.min(noteTimeline.length - 1, i + 1))
   }
 
@@ -1114,6 +1077,7 @@ function App() {
     const idx = noteTimeline.findIndex((m) => m.measure === target)
     if (idx !== -1) {
       lastTickSetRef.current = -1
+      resetStepState()
       setCurrentNoteIndex(idx)
     }
   }
@@ -1124,6 +1088,7 @@ function App() {
     const idx = noteTimeline.findIndex((m) => m.measure === target)
     if (idx !== -1) {
       lastTickSetRef.current = -1
+      resetStepState()
       setCurrentNoteIndex(idx)
     }
   }
