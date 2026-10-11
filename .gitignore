@@ -46,6 +46,3 @@ generate_lieder_index.mjs
 curate_lieder.mjs
 make_icon.mjs
 
-# Downloaded test audio for tools/analyzeAudio.mjs (not repo assets)
-tools/samples/
-

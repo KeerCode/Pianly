@@ -2,10 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import createVerovioModule from 'verovio/wasm'
 import { VerovioToolkit } from 'verovio/esm'
 import { enableMidi, listenToDevice, onDevicesChanged } from '../input/midiInput'
-import { startPredictiveDetection } from '../input/predictiveDetector'
-import MicSetup from '../MicSetup'
-import { saveTake } from '../input/saveTake'
-import { useMicCalibration, calibrationStatus } from '../useMicCalibration'
+import { startBasicPitchDetection, loadBasicPitchModel } from '../input/pitchDetector'
 import { noteNameToMidi } from '../utils/noteConversion'
 import Background from '../Background'
 import { useTheme } from '../ThemeContext'
@@ -224,10 +221,6 @@ export default function ReadPractice() {
   const [stats, setStats]                 = useState({ times: [], total: 0, score: 0 })
   const [heldNotes, setHeldNotes]         = useState([])     // MIDI ints currently held
   const [targetNotes, setTargetNotes]     = useState([])     // flat sorted MIDI int list for display
-  const [micDebug, setMicDebug]           = useState(null)   // live predictive-detector candidate breakdown
-  const [showMicSetup, setShowMicSetup]     = useState(false)
-  const [takeStatus, setTakeStatus]         = useState(null)   // result of the last "Save last 30 s"
-  const micCal = useMicCalibration()
 
   // ── Refs for use inside callbacks / effects ──
   const vrvRef          = useRef(null)
@@ -239,9 +232,6 @@ export default function ReadPractice() {
   const heldNotesRef    = useRef(new Set())
   const advancingRef         = useRef(false)
   const stopMicRef           = useRef(null)
-  const setExpectedRef       = useRef(null)   // predictive detector's setExpected(midis), while mic input is active
-  const captureTakeRef       = useRef(null)   // predictive detector's captureTake(), same lifetime
-  const lastMicDebugAtRef    = useRef(0)
   const statsRef             = useRef({ times: [], total: 0, score: 0 })
   const advanceRef           = useRef(null)   // forward-ref to advanceTarget
   const updateHeldDisplayRef = useRef(null)   // syncs heldNotes state from heldNotesRef
@@ -287,7 +277,6 @@ export default function ReadPractice() {
     const tgt = generateTarget(difficultyRef.current)
     targetRef.current = tgt
     setTargetNotes([...tgt.rightNotes, ...tgt.leftNotes].sort((a, b) => a - b))
-    setExpectedRef.current?.([...tgt.rightNotes, ...tgt.leftNotes], { mono: tgt.rightNotes.length + tgt.leftNotes.length === 1 })
     renderTarget(tgt)
     reactionStartRef.current = Date.now()
   }, [renderTarget])
@@ -381,36 +370,22 @@ export default function ReadPractice() {
   useEffect(() => {
     if (screen !== 'playing' || inputMethod !== 'mic') return
     let stopFn = null
-    const tgt = targetRef.current
-    const expected = tgt ? [...tgt.rightNotes, ...tgt.leftNotes] : []
-    const mono = tgt ? tgt.rightNotes.length + tgt.leftNotes.length === 1 : false
+    loadBasicPitchModel()
 
-    startPredictiveDetection({
-      onNotes: (noteNames) => {
-        if (!noteNames) {
-          heldNotesRef.current.clear()
-          updateHeldDisplayRef.current?.()
-          return
-        }
-        const midis = noteNames.map(noteNameToMidi).filter(m => m !== null)
+    startBasicPitchDetection((noteNames) => {
+      if (!noteNames) {
         heldNotesRef.current.clear()
-        midis.forEach(m => heldNotesRef.current.add(m))
         updateHeldDisplayRef.current?.()
-        checkMatchRef.current?.()
-      },
-      expected,
-      mono,
-      onDebug: (info) => {
-        const now = performance.now()
-        if (now - lastMicDebugAtRef.current < 120) return
-        lastMicDebugAtRef.current = now
-        setMicDebug(info)
-      },
-    }).then(({ stop, setExpected, captureTake }) => {
+        return
+      }
+      const midis = noteNames.map(noteNameToMidi).filter(m => m !== null)
+      heldNotesRef.current.clear()
+      midis.forEach(m => heldNotesRef.current.add(m))
+      updateHeldDisplayRef.current?.()
+      checkMatchRef.current?.()
+    }).then(stop => {
       stopFn = stop
       stopMicRef.current = stop
-      setExpectedRef.current = setExpected
-      captureTakeRef.current = captureTake
     }).catch((err) => {
       console.error('[ReadPractice] Mic start failed:', err)
     })
@@ -418,26 +393,9 @@ export default function ReadPractice() {
     return () => {
       stopFn?.()
       stopMicRef.current = null
-      setExpectedRef.current = null
-      captureTakeRef.current = null
-      setMicDebug(null)
       heldNotesRef.current.clear()
     }
   }, [screen, inputMethod])
-
-  // Save the last ~30 s of mic audio + expected notes + what was reported, so a
-  // miss can be replayed offline against this exact piano/mic (tools/replayTake.mjs).
-  const handleSaveTake = useCallback(async () => {
-    const capture = captureTakeRef.current
-    if (!capture) { setTakeStatus('Mic is not running.'); return }
-    try {
-      const tgt = targetRef.current
-      const r = await saveTake(capture({ page: 'read', difficulty, target: tgt ? [...tgt.rightNotes, ...tgt.leftNotes] : [] }))
-      setTakeStatus(r.path ? `Saved to Downloads: ${r.name}` : `Downloaded ${r.name}`)
-    } catch (err) {
-      setTakeStatus(`Could not save: ${err?.message || 'unknown error'}`)
-    }
-  }, [difficulty])
 
   // ── Start game ──
   const startGame = useCallback(() => {
@@ -447,7 +405,6 @@ export default function ReadPractice() {
     heldNotesRef.current.clear()
     setHeldNotes([])
     setTargetNotes([...tgt.rightNotes, ...tgt.leftNotes].sort((a, b) => a - b))
-    setExpectedRef.current?.([...tgt.rightNotes, ...tgt.leftNotes], { mono: tgt.rightNotes.length + tgt.leftNotes.length === 1 })
     setStats({ times: [], total: 0, score: 0 })
     setReactionFlash(null)
     setScreen('playing')
@@ -463,7 +420,6 @@ export default function ReadPractice() {
     advancingRef.current = false
     heldNotesRef.current.clear()
     stopMicRef.current?.()
-    setExpectedRef.current = null
     const s = statsRef.current
     if (modeRef.current === 'practice' && s.total > 0) {
       setScreen('summary')
@@ -575,19 +531,6 @@ export default function ReadPractice() {
               </button>
             ))}
 
-            {inputMethod === 'mic' && (
-              <button
-                onClick={() => setShowMicSetup(true)}
-                className="px-3 py-2 rounded-lg text-sm transition-all cursor-pointer border"
-                style={micCal.noteCount
-                  ? { borderColor: 'var(--border)', color: 'var(--sub)' }
-                  : { borderColor: 'var(--accent)', color: 'var(--accent)', background: 'rgba(0,255,200,0.06)' }}
-                title="Play a few notes once so Pianly learns your piano and mic"
-              >
-                {micCal.noteCount ? `Mic setup · ${calibrationStatus(micCal)}` : 'Set up mic'}
-              </button>
-            )}
-
             <div className="w-px h-5" style={{ background: 'var(--border)' }} />
 
             <button
@@ -612,7 +555,6 @@ export default function ReadPractice() {
             Start
           </button>
         </div>
-        {showMicSetup && <MicSetup onClose={() => setShowMicSetup(false)} />}
       </div>
     )
   }
@@ -797,37 +739,6 @@ export default function ReadPractice() {
           </div>
         )}
       </div>
-
-      {/* Live predictive-detector breakdown — every held candidate and why it fired */}
-      {inputMethod === 'mic' && micDebug && (
-        <div className="fixed bottom-4 right-4 z-[100] w-72 rounded-xl p-3 font-mono text-[10px] leading-relaxed shadow-2xl" style={{background:'oklch(0.12 0.025 270 / 0.95)',border:'1px solid var(--border)'}}>
-          <div className="flex items-center justify-between mb-1.5">
-            <span className="font-bold text-xs" style={{color:'var(--sub)'}}>Mic detector</span>
-            <span style={{color: micDebug.hasNoise ? '#4ade80' : '#f59e0b'}}>
-              {micDebug.hasNoise ? 'noise profile learned' : 'no noise profile yet'}
-            </span>
-          </div>
-          <div className="mb-1.5" style={{color:'var(--sub)',opacity:.7}}>rms {micDebug.rms.toFixed(4)} · {micDebug.calibration ? `calibrated: ${micDebug.calibration}` : 'not calibrated'}</div>
-          {micDebug.active.length === 0 && <p style={{color:'var(--sub)',opacity:.5}}>Nothing held.</p>}
-          {micDebug.active.map((a) => (
-            <div key={a.midi} className="flex items-center justify-between" style={{color: a.expected ? '#4ade80' : '#f87171'}}>
-              <span>{a.name}{a.expected ? ' (expected)' : ' (extra)'}</span>
-              <span>rel {a.rel} · snr {a.snr}</span>
-            </div>
-          ))}
-          <div className="mt-2 pt-2" style={{ borderTop: '1px solid var(--panel)' }}>
-            <button
-              onClick={handleSaveTake}
-              className="px-2 py-1 rounded-md cursor-pointer border"
-              style={{ borderColor: 'var(--border)', color: 'var(--ink)' }}
-              title="Save the last 30 s of mic audio, the expected notes and what the detector reported, to replay offline"
-            >
-              Save last 30 s
-            </button>
-            {takeStatus && <p className="mt-1 break-all" style={{ color: 'var(--sub)', opacity: 0.8 }}>{takeStatus}</p>}
-          </div>
-        </div>
-      )}
     </div>
   )
 }

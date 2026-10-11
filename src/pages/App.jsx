@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import { unzipSync } from 'fflate'
 import createVerovioModule from 'verovio/wasm'
 import { VerovioToolkit } from 'verovio/esm'
@@ -8,12 +8,8 @@ import { DEMO_PIECES, loadDemoScore } from '../data/demoScores'
 import { noteNameToMidi, getInterval } from '../utils/noteConversion'
 import { getSavedFolder, pickFolder, listScores, loadScore } from '../lib/scoreFolder'
 import { enableMidi, listenToDevice, notesMatch, onDevicesChanged } from '../input/midiInput'
+import { startBasicPitchDetection, loadBasicPitchModel, isBasicPitchReady } from '../input/pitchDetector'
 import { MidiStepGate } from '../practice/midiStepGate'
-import { startPredictiveDetection } from '../input/predictiveDetector'
-import MicSetup from '../MicSetup'
-import { useMicCalibration, calibrationStatus } from '../useMicCalibration'
-import { octavePairLowers } from '../input/micCalibration'
-import { saveTake } from '../input/saveTake'
 import { parseNoteTimelineOSMD } from '../parsers/osmdParser'
 import { tickToSec } from '../parsers/parseTimeline'
 import Background from '../Background'
@@ -44,21 +40,6 @@ function decodeToXmlStr(musicXml) {
     try { return new TextDecoder().decode(musicXml) } catch { return null }
   }
   return null
-}
-
-/** Convert target note names to expected MIDI numbers for the predictive detector.
- * With `anyOctave`, expands each pitch class to every octave in the detector's range
- * so the score-informed prior applies regardless of which octave is played. */
-function notesToExpectedMidi(notes, anyOctave) {
-  if (!notes) return []
-  const midis = notes.map(noteNameToMidi).filter((m) => m != null)
-  if (!anyOctave) return midis
-  const classes = new Set(midis.map((m) => ((m % 12) + 12) % 12))
-  const out = []
-  for (let m = 21; m <= 108; m++) {
-    if (classes.has(((m % 12) + 12) % 12)) out.push(m)
-  }
-  return out
 }
 
 /**
@@ -92,39 +73,6 @@ function injectSystemBreaksAtTimeSigChange(xmlStr) {
   }
 }
 
-// Mic only: after advancing on a match, the note we just matched is still
-// ringing. It (and its harmonic/octave shadows) is ignored until it stops, is re-struck, or a new
-// correct-looking note appears; this caps how long evaluation of the next
-// target is held off if none of those is detected.
-const MIC_RINGOVER_MS = 1500
-// A ringing note only counts as gone after it's been absent from the detector this
-// long. A single report without it is a flicker (the detector often momentarily
-// lists only the newest note), and forgetting it then made the note look new —
-// and wrong — when it reappeared a moment later.
-const STALE_GRACE_MS = 600
-// Attacks within this long after an old-sound snapshot don't count as a re-strike
-// (they are the tail of the note that was just matched).
-const RESTRIKE_MARGIN_MS = 60
-
-// Semitone distances at which a detected note is probably a shadow of a still-
-// ringing one rather than a new note: octaves (12, 24) exactly, and the 3rd..10th
-// harmonic range (19, 28-40, +-1 for low-frequency smear) — the same offsets the
-// detector's own ghost rules use. Seen live: the previous chord's octave/harmonic
-// ghosts (E1, F1, A1 under a ringing E2/A3) were judged as wrong notes.
-const SHADOW_DISTANCES = new Set([12, 24, 18, 19, 20, ...Array.from({ length: 15 }, (_, i) => 27 + i)])
-
-/**
- * Identity of a note for ring-over tracking: its exact MIDI number, or just the
- * pitch class in "any octave" mode (where the octave is irrelevant). Exact by
- * default because the *same letter in another octave is a different note* — an
- * earlier pitch-class version treated the next note C3 as "C4 still ringing"
- * and stalled on every octave-different repeat (C4 -> C3, E3 -> E4).
- */
-function noteKeyOf(name, anyOctave) {
-  const m = noteNameToMidi(name ?? '')
-  if (m == null) return null
-  return anyOctave ? ((m % 12) + 12) % 12 : m
-}
 const HINT_DELAY_MS = 3000
 const MAX_WRONG_ATTEMPTS = 3
 
@@ -179,16 +127,6 @@ function App() {
   const [modelReady, setModelReady] = useState(false)
   const [showDebug, setShowDebug] = useState(false)
   const [debugLog, setDebugLog] = useState([])
-  const [micDebug, setMicDebug] = useState(null) // live predictive-detector candidate breakdown
-  const [showMicSetup, setShowMicSetup] = useState(false)
-  const [takeStatus, setTakeStatus] = useState(null) // result of the last "Save last 30 s"
-  const micCal = useMicCalibration()
-  // Lower notes of the octave pairs in the loaded piece — the only notes mic
-  // calibration changes anything for (see MicSetup `pieceMidis`).
-  const pieceMidis = useMemo(
-    () => octavePairLowers(noteTimeline.map((n) => notesToExpectedMidi(n.notes, false))),
-    [noteTimeline],
-  )
 
   const fileInputRef = useRef(null)
   const svgContainerRef = useRef(null)   // Verovio SVG output container
@@ -206,9 +144,6 @@ function App() {
 
   const stopListenerRef = useRef(null)
   const stopMicRef = useRef(null)
-  const setExpectedRef = useRef(null)   // predictive detector's setExpected(midis), while mic practice is running
-  const captureTakeRef = useRef(null)   // predictive detector's captureTake(), same lifetime
-  const lastMicDebugAtRef = useRef(0)
   const wrongTimerRef = useRef(null)
 
   const currentNoteIndexRef = useRef(0)
@@ -218,17 +153,12 @@ function App() {
   const anyOctaveRef = useRef(false)
   const modeRef = useRef('idle')
   const heldNotesRef = useRef(new Set())
-  const waitingForReleaseRef = useRef(false) // true = correct note played, waiting for release to advance (MIDI)
+  const waitingForReleaseRef = useRef(false) // true = correct note played, waiting for release to advance
   // MIDI step gate: which keys count for the current step, which are left over
   // from steps already accepted (see src/practice/midiStepGate.js).
   const midiGateRef = useRef(null)
   if (midiGateRef.current === null) midiGateRef.current = new MidiStepGate((a, b, any) => notesMatch(a, b, any))
   const inputModeRef = useRef('midi')
-  const staleNotesRef = useRef(new Map())    // mic: note key -> time it was last missing (null = still heard); the note we just advanced past
-  const evalBlockedRef = useRef(false)       // mic: hold off judging the next target until the old sound clears
-  const staleCreatedAtRef = useRef(0)        // mic: when the current old-sound snapshot was taken
-  const lastAttackAtRef = useRef(0)          // mic: time of the most recent fresh attack (onset) from the detector
-  const evalBlockTimerRef = useRef(null)
   const wrongCountRef = useRef(0) // counts wrong attempts for current note
   const lastTickSetRef = useRef(-1)
   const autoscrollRef = useRef(true)
@@ -317,20 +247,18 @@ function App() {
     }
   }, [])
 
-  // Predictive detector needs no model load — it's a plain FFT, ready instantly.
+  // Preload Basic Pitch model when mic mode is selected
   useEffect(() => {
     if (inputMode !== 'mic') return
-    setModelLoading(false)
-    setModelReady(true)
+    if (isBasicPitchReady()) {
+      setModelReady(true)
+      return
+    }
+    setModelLoading(true)
+    loadBasicPitchModel()
+      .then(() => { setModelReady(true); setModelLoading(false) })
+      .catch((err) => { console.error('[BasicPitch] Model load failed:', err); setModelLoading(false) })
   }, [inputMode])
-
-  // Keep the live detector's expected-note prior in sync with the current target
-  // while mic practice is running.
-  useEffect(() => {
-    if (mode !== 'practice' || inputMode !== 'mic') return
-    const target = noteTimeline[currentNoteIndex]
-    setExpectedRef.current?.(notesToExpectedMidi(target?.notes, anyOctave), { mono: target?.notes?.length === 1, anyOctave })
-  }, [mode, inputMode, currentNoteIndex, noteTimeline, anyOctave])
 
   // Check microphone permission
   useEffect(() => {
@@ -613,20 +541,15 @@ function App() {
   // Practice mode: advance on correct input
   // ---------------------------------------------------------------------------
 
-  // Advance to the next note, skipping any tied notes
+  // Advance to the next note
   const doAdvance = useCallback(() => {
-    // No re-trigger cooldown: a step completes the moment its keys are down and
-    // those keys then count as old until let go (MidiStepGate / the mic's
-    // ring-over tracking), so one press can't advance twice. The old 150 ms
-    // cooldown silently dropped the next note when it arrived inside it - a
-    // sixteenth note at 100 bpm is exactly 150 ms.
+    // No re-trigger cooldown: once a step is accepted its keys count as old
+    // until let go (MidiStepGate), so one press can't advance twice. The old
+    // 150 ms cooldown silently dropped the next note when it arrived inside it.
+    // No tie skipping either: the parser already drops tie continuations, so the
+    // entry after a tied one is a real step (skipping it jumped over chords).
     const nextIdx = currentNoteIndexRef.current + 1
     const tl = noteTimelineRef.current
-
-    // (Tie continuations are not in the timeline - the parser drops them - so
-    // there is nothing to skip; the entry after a tied one is a real step. The
-    // old skip jumped over chords: on Maple Leaf Rag the player was asked for
-    // notes later than the cursor showed.)
 
     if (nextIdx >= tl.length) {
       setCompleted(true)
@@ -671,67 +594,6 @@ function App() {
     })
   }, [])
 
-  // ---- mic ring-over: advance the moment the right note is heard ----------
-  const endRingOverBlock = () => {
-    evalBlockedRef.current = false
-    clearTimeout(evalBlockTimerRef.current)
-    evalBlockTimerRef.current = null
-  }
-  const resetRingOver = () => {
-    staleNotesRef.current = new Map()
-    midiGateRef.current.clear()
-    endRingOverBlock()
-  }
-  // Is this detected note the OLD sound (still ringing, or its shadow) rather
-  // than something the player just did? A note the current target wants always
-  // counts, unless it is exactly the stale note itself (then it needs a re-strike).
-  const isOldSound = (name, targetKeys) => {
-    const stale = staleNotesRef.current
-    if (stale.size === 0) return false
-    const anyOct = anyOctaveRef.current
-    const key = noteKeyOf(name, anyOct)
-    if (key == null) return false
-    if (stale.has(key)) return true
-    if (targetKeys.has(key) || anyOct) return false
-    for (const s of stale.keys()) if (SHADOW_DISTANCES.has(Math.abs(key - s))) return true
-    return false
-  }
-  // Called for every mic detection with notes present: updates which notes are
-  // still "the old sound" and decides whether the next target can be judged yet.
-  const settleRingOver = (notes, info) => {
-    const stale = staleNotesRef.current
-    if (stale.size === 0 && !evalBlockedRef.current) return
-    const anyOct = anyOctaveRef.current
-    const keys = notes.map((n) => noteKeyOf(n, anyOct))
-    const present = new Set(keys)
-    const nowPrune = performance.now()
-    for (const [k, goneSince] of [...stale]) {
-      if (present.has(k)) stale.set(k, null)
-      else if (goneSince == null) stale.set(k, nowPrune)              // first report without it: maybe a flicker
-      else if (nowPrune - goneSince > STALE_GRACE_MS) stale.delete(k) // absent long enough: it stopped ringing
-    }
-    const target = noteTimelineRef.current[currentNoteIndexRef.current]
-    const targetKeys = new Set((target?.notes ?? []).map((n) => noteKeyOf(n, anyOct)))
-    // A fresh attack on a note that was ringing AND is wanted now = the same
-    // note played again (repeated notes), so it counts.
-    // The attack does not have to arrive together with the note's first report:
-    // when the newest note is still ringing the detector may keep listing it
-    // (monophonic estimate) for a while, so the re-struck note only shows up
-    // after its attack is over. Any attack since the snapshot counts (the
-    // margin skips the tail of the note we just matched, whose own attack
-    // frames are still arriving).
-    let restruck = false
-    if (lastAttackAtRef.current > staleCreatedAtRef.current + RESTRIKE_MARGIN_MS) {
-      for (const k of keys) {
-        if (stale.has(k) && targetKeys.has(k)) { stale.delete(k); restruck = true }
-      }
-    }
-    // A note that wasn't part of the old sound: a new correct note, or a fresh
-    // attack on anything new (a wrong note should still get feedback promptly).
-    const fresh = notes.some((n, i) => !isOldSound(n, targetKeys) && (targetKeys.has(keys[i]) || info?.onset))
-    if (evalBlockedRef.current && (stale.size === 0 || fresh || restruck)) endRingOverBlock()
-  }
-
   // Called when notes are detected (MIDI noteOn or mic detection)
   const checkNotes = useCallback(() => {
     if (completedRef.current || pausedRef.current) return
@@ -766,15 +628,9 @@ function App() {
       return
     }
 
-    if (evalBlockedRef.current) return
-
     const targetNotes = target.notes
     const anyOct = anyOctaveRef.current
-    const heldAll = [...heldNotesRef.current]
-    // Mic: ignore the still-ringing previous note (see noteKeyOf).
-    const stale = staleNotesRef.current
-    const targetKeys = new Set(targetNotes.map((n) => noteKeyOf(n, anyOct)))
-    const held = stale.size ? heldAll.filter((h) => !isOldSound(h, targetKeys)) : heldAll
+    const held = [...heldNotesRef.current]
 
     if (held.length === 0) return
 
@@ -789,24 +645,12 @@ function App() {
     )
 
     if (allTargetsHeld && noExtras) {
+      // Correct — wait for release before advancing
+      waitingForReleaseRef.current = true
       clearTimeout(wrongTimerRef.current)
       wrongTimerRef.current = null
       setShowHint(false)
       wrongCountRef.current = 0
-      if (inputModeRef.current === 'mic') {
-        // A mic can't see a key release — the note just rings and decays for
-        // seconds, and waiting for it made every advance pause. Move on now and
-        // treat whatever is sounding as the old note until it clears.
-        staleNotesRef.current = new Map(heldAll.map((h) => noteKeyOf(h, anyOct)).filter((k) => k != null).map((k) => [k, null]))
-        staleCreatedAtRef.current = performance.now()
-        evalBlockedRef.current = true
-        clearTimeout(evalBlockTimerRef.current)
-        evalBlockTimerRef.current = setTimeout(endRingOverBlock, MIC_RINGOVER_MS)
-        doAdvance()
-      } else {
-        // MIDI has an exact note-off: wait for it before advancing
-        waitingForReleaseRef.current = true
-      }
     } else if (noExtras && !allTargetsHeld) {
       // User is still building the chord — all held notes are valid targets,
       // just not all of them pressed yet. Don't penalize, just wait.
@@ -906,13 +750,10 @@ function App() {
     stopListenerRef.current = null
     stopMicRef.current?.()
     stopMicRef.current = null
-    setExpectedRef.current = null
-    captureTakeRef.current = null
-    setMicDebug(null)
     clearTimeout(wrongTimerRef.current)
     wrongTimerRef.current = null
-    resetRingOver()
     heldNotesRef.current.clear()
+    midiGateRef.current.clear()
     stopToneListenLoop()
     Tone.getTransport().stop()
     Tone.getTransport().cancel()
@@ -1237,7 +1078,7 @@ function App() {
     setShowHint(false)
     setMode('practice')
     lastTickSetRef.current = -1
-    resetRingOver()
+    midiGateRef.current.clear()
 
     if (inputMode === 'midi') {
       if (!selectedDeviceId) {
@@ -1252,6 +1093,7 @@ function App() {
       const stop = await listenToDevice(
         selectedDeviceId,
         (note) => {
+          midiGateRef.current.noteOn(note, performance.now())
           heldNotesRef.current.add(note)
           setDetectedNote([...heldNotesRef.current].join(' + '))
           checkNotes()
@@ -1266,35 +1108,21 @@ function App() {
       }
     } else {
       try {
-        const onNotes = (notes, info) => {
+        const onNotes = (notes) => {
           if (notes && notes.length > 0) {
             heldNotesRef.current.clear()
             for (const n of notes) heldNotesRef.current.add(n)
             setDetectedNote(notes.join(' + '))
-            if (info?.onset) lastAttackAtRef.current = performance.now()
-            settleRingOver(notes, info)
             checkNotes()
           } else {
-            // Silence — the old note has fully stopped, so everything is fresh again
+            // All notes released — trigger release logic
             heldNotesRef.current.clear()
             setDetectedNote(null)
-            resetRingOver()
             handleRelease()
           }
         }
-        const expected = notesToExpectedMidi(noteTimeline[0]?.notes, anyOctave)
-        // One target note (any-octave expansion included) -> YIN-first detection.
-        const mono = noteTimeline[0]?.notes?.length === 1
-        const onDebug = (info) => {
-          const now = performance.now()
-          if (now - lastMicDebugAtRef.current < 120) return
-          lastMicDebugAtRef.current = now
-          setMicDebug(info)
-        }
-        const { stop, setExpected, captureTake } = await startPredictiveDetection({ onNotes, expected, mono, anyOctave, onDebug })
+        const stop = await startBasicPitchDetection(onNotes)
         stopMicRef.current = stop
-        setExpectedRef.current = setExpected
-        captureTakeRef.current = captureTake
       } catch (err) {
         const denied = err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError'
         setInputError(
@@ -1304,19 +1132,6 @@ function App() {
         )
         setMode('idle')
       }
-    }
-  }
-
-  // Save the last ~30 s of mic audio + expected notes + what was reported, so a
-  // miss can be replayed offline against this exact piano/mic (tools/replayTake.mjs).
-  async function handleSaveTake() {
-    const capture = captureTakeRef.current
-    if (!capture) { setTakeStatus('Mic is not running.'); return }
-    try {
-      const r = await saveTake(capture({ page: 'sheet', step: currentNoteIndex, steps: noteTimeline.length, anyOctave }))
-      setTakeStatus(r.path ? `Saved to Downloads: ${r.name}` : `Downloaded ${r.name}`)
-    } catch (err) {
-      setTakeStatus(`Could not save: ${err?.message || 'unknown error'}`)
     }
   }
 
@@ -1349,19 +1164,16 @@ function App() {
     clearTimeout(wrongTimerRef.current)
     wrongTimerRef.current = null
     lastTickSetRef.current = -1
-    resetRingOver()
   }
 
   // Navigation
   function handlePrevMoment() {
     lastTickSetRef.current = -1
-    resetRingOver()
     setCurrentNoteIndex((i) => Math.max(0, i - 1))
   }
 
   function handleNextMoment() {
     lastTickSetRef.current = -1
-    resetRingOver()
     setCurrentNoteIndex((i) => Math.min(noteTimeline.length - 1, i + 1))
   }
 
@@ -1372,7 +1184,6 @@ function App() {
     const idx = noteTimeline.findIndex((m) => m.measure === target)
     if (idx !== -1) {
       lastTickSetRef.current = -1
-      resetRingOver()
       setCurrentNoteIndex(idx)
     }
   }
@@ -1383,7 +1194,6 @@ function App() {
     const idx = noteTimeline.findIndex((m) => m.measure === target)
     if (idx !== -1) {
       lastTickSetRef.current = -1
-      resetRingOver()
       setCurrentNoteIndex(idx)
     }
   }
@@ -1714,26 +1524,6 @@ function App() {
                 </div>
               </div>
 
-              {/* Mic Setup (mic input only) */}
-              {inputMode === 'mic' && (
-                <div>
-                  <p className="text-[10px] uppercase tracking-widest mb-3" style={{color:'var(--sub)'}}>Mic Setup</p>
-                  <div className="flex items-center justify-between gap-3 rounded-xl border p-4" style={{borderColor:'var(--border)',background:'rgba(0,255,200,0.03)'}}>
-                    <div className="min-w-0">
-                      <p className="text-sm truncate" style={{color: micCal.noteCount ? 'var(--ink)' : 'var(--sub)'}}>{calibrationStatus(micCal)}</p>
-                      <p className="text-[10px] mt-1" style={{color:'var(--sub)',opacity:.6}}>Play a few notes once so Pianly learns your piano and mic. Saved on this device; redo it for a different piano.</p>
-                    </div>
-                    <button
-                      onClick={() => setShowMicSetup(true)}
-                      className="px-3 py-1.5 rounded-lg text-xs font-medium border cursor-pointer shrink-0"
-                      style={{borderColor:'var(--accent)',color:'var(--accent)',background:'rgba(0,255,200,0.06)'}}
-                    >
-                      {micCal.noteCount ? 'Manage' : 'Set up mic'}
-                    </button>
-                  </div>
-                </div>
-              )}
-
               {/* Default Tempo */}
               <div>
                 <p className="text-[10px] uppercase tracking-widest mb-3" style={{color:'var(--sub)'}}>Default Tempo (BPM)</p>
@@ -1877,7 +1667,7 @@ function App() {
               {inputMode === 'mic' ? (
                 <>
                   <span className={`inline-block w-1.5 h-1.5 rounded-full ${modelLoading ? 'animate-pulse' : ''}`} style={{background:'var(--accent)'}} />
-                  <span>Microphone</span>
+                  <span>Microphone (Basic Pitch){modelLoading && ' — loading model...'}</span>
                 </>
               ) : selectedDevice ? (
                 <>
@@ -2204,28 +1994,15 @@ function App() {
               {inputMode === 'mic' && (
                 <div className="mb-5">
                   <label className="text-xs uppercase tracking-wider font-medium mb-2 block" style={{color:'var(--sub)'}}>Detection Engine</label>
-                  <p className="text-sm" style={{color:'var(--ink)'}}>Score-informed pitch detector</p>
-                  <p className="text-[10px] mt-1.5" style={{color:'var(--sub)',opacity:.5}}>FFT-based detection weighted toward the notes the score expects next. Supports chords.</p>
-                  {modelReady && <p className="text-[10px] mt-2" style={{color:'var(--ink)'}}>Ready</p>}
-                </div>
-              )}
-
-              {inputMode === 'mic' && (
-                <div className="mb-5">
-                  <label className="text-xs uppercase tracking-wider font-medium mb-2 block" style={{color:'var(--sub)'}}>Mic Setup</label>
-                  <div className="flex items-center justify-between gap-3">
-                    <p className="text-sm min-w-0 truncate" style={{color: micCal.noteCount ? 'var(--ink)' : 'var(--sub)'}}>
-                      {calibrationStatus(micCal)}
-                    </p>
-                    <button
-                      onClick={() => { setShowSettings(false); setShowMicSetup(true) }}
-                      className="px-3 py-1.5 rounded-lg text-xs font-medium border cursor-pointer shrink-0"
-                      style={{borderColor:'var(--accent)',color:'var(--accent)',background:'rgba(0,255,200,0.06)'}}
-                    >
-                      {micCal.noteCount ? 'Manage' : 'Set up mic'}
-                    </button>
-                  </div>
-                  <p className="text-[10px] mt-1.5" style={{color:'var(--sub)',opacity:.5}}>Play a few notes once so Pianly learns your piano and mic. Saved on this device; redo it for a different piano.</p>
+                  <p className="text-sm" style={{color:'var(--ink)'}}>Basic Pitch (Spotify ML)</p>
+                  <p className="text-[10px] mt-1.5" style={{color:'var(--sub)',opacity:.5}}>ML-powered polyphonic note detection. Supports chords.</p>
+                  {modelLoading && (
+                    <div className="flex items-center gap-2 mt-2 text-xs" style={{color:'var(--sub)'}}>
+                      <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+                      Loading audio model...
+                    </div>
+                  )}
+                  {modelReady && <p className="text-[10px] mt-2" style={{color:'var(--ink)'}}>Model ready</p>}
                 </div>
               )}
 
@@ -2293,35 +2070,6 @@ function App() {
           </button>
         </div>
       )}
-
-      {/* Live predictive-detector breakdown — every held candidate and why it fired */}
-      {mode === 'practice' && inputMode === 'mic' && micDebug && (
-        <div className="fixed bottom-4 right-4 z-[100] w-72 rounded-xl p-3 font-mono text-[10px] leading-relaxed shadow-2xl" style={{background:'oklch(0.12 0.025 270 / 0.95)',border:'1px solid var(--border)'}}>
-          <div className="flex items-center justify-between mb-1.5">
-            <span className="font-bold text-xs" style={{color:'var(--sub)'}}>Mic detector</span>
-            <span style={{color: micDebug.hasNoise ? '#4ade80' : '#f59e0b'}}>
-              {micDebug.hasNoise ? 'noise profile learned' : 'no noise profile yet'}
-            </span>
-          </div>
-          <div className="mb-1.5" style={{color:'var(--sub)',opacity:.7}}>rms {micDebug.rms.toFixed(4)} · {micDebug.calibration ? `calibrated: ${micDebug.calibration}` : 'not calibrated'}</div>
-          {micDebug.active.length === 0 && <p style={{color:'var(--sub)',opacity:.5}}>Nothing held.</p>}
-          {micDebug.active.map((a) => (
-            <div key={a.midi} className="flex items-center justify-between" style={{color: a.expected ? '#4ade80' : '#f87171'}}>
-              <span>{a.name}{a.expected ? ' (expected)' : ' (extra)'}</span>
-              <span>rel {a.rel} · snr {a.snr}</span>
-            </div>
-          ))}
-          <div className="mt-2 pt-2" style={{borderTop:'1px solid var(--panel)'}}>
-            <button onClick={handleSaveTake} className="px-2 py-1 rounded-md cursor-pointer border" style={{borderColor:'var(--border)',color:'var(--ink)'}}
-              title="Save the last 30 s of mic audio, the expected notes and what the detector reported, to replay offline">
-              Save last 30 s
-            </button>
-            {takeStatus && <p className="mt-1 break-all" style={{color:'var(--sub)',opacity:.8}}>{takeStatus}</p>}
-          </div>
-        </div>
-      )}
-
-      {showMicSetup && <MicSetup onClose={() => setShowMicSetup(false)} pieceMidis={pieceMidis} />}
 
       {/* Debug panel */}
       {showDebug && (

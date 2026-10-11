@@ -66,4 +66,4 @@ keys. See `src/practice/practiceGate.js`.
   past (24 px at 0.12 s) first.
 * Sheet Practice has no clock, so a wrong key is still judged strictly: a key
   that was never part of an accepted step flags wrong until it is let go.
-* Mic input is unchanged by this work (it already advanced on detection).
+* Mic input (Basic Pitch) is not simulated here; these numbers are for MIDI.
