@@ -148,9 +148,10 @@ function simulate(timeline, bpm, gate, p = {}) {
       const r = sess.step({ timeline, nowSec: nextSong, startSec, endSec, noteMidi, nowMs: wall })
       required = r.required; confirmed = r.confirmed
       if (r.required.size) lastRequired = r.required
-      blocked = r.required.size > 0 && r.state !== 'satisfied'
+      // The clock keeps flowing through the lateness grace, then stops just after the landing.
+      blocked = r.required.size > 0 && r.state !== 'satisfied' && r.overdue
       landSec = r.landSec
-      if (blocked) nextSong = Math.min(nextSong, landSec)     // the clock never passes an unplayed group
+      if (blocked) nextSong = Math.min(nextSong, r.holdAt)
       if (stray && !stray.done && stray.on && blocked) stats.wrongNoteStallMs += dtMs
       if (p.debug && blocked && !stalled && !simulate._dbg) {
         simulate._dbg = true
@@ -243,7 +244,9 @@ for (const [name, tl, bpm] of PIECES) {
   const o = simulate(tl, bpm, 'old', { lateMs: 250 })
   const n = simulate(tl, bpm, 'new', { lateMs: 250 })
   console.log(`     ${name}`); row('old logic', o); row('new gate', n)
-  check(`${name}: new gate stops exactly on the asked-for notes`, n.maxOvershootPx < 1.5 && n.vanishedAtStall === 0, `overshoot ${n.maxOvershootPx.toFixed(1)} px, gone ${n.vanishedAtStall}`)
+  // The clock stops lateGraceSec (0.12 s = 24 px) after the landing and the page pins the
+  // asked-for bars to the keys, so what is waited for is always on screen.
+  check(`${name}: new gate stops within the lateness grace of the asked-for notes`, n.maxOvershootPx <= 0.12 * FALL_PX_PER_SEC + 1.5, `overshoot ${n.maxOvershootPx.toFixed(1)} px`)
   check(`${name}: new gate still gets to the end`, n.confirmedAll)
   check(`${name}: old logic let bars scroll past before pausing`, o.maxOvershootPx > 20 || o.vanishedAtStall > 0, `overshoot ${o.maxOvershootPx.toFixed(0)} px, gone ${o.vanishedAtStall}`)
 }

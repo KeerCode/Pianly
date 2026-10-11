@@ -13,6 +13,7 @@
     "test:wizard": "node tools/wizardTest.mjs",
     "test:take": "node tools/takeTest.mjs",
     "test:practice": "node tools/practiceGateTest.mjs",
+    "test:pace": "node tools/paceTest.mjs",
     "replay": "node tools/replayTake.mjs",
     "analyze": "node tools/analyzeAudio.mjs",
     "tauri": "tauri",

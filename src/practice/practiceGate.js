@@ -17,20 +17,27 @@
  *     (people lift a beat late); after that, still holding it IS a stray key.
  *     A key for a note landing within `earlyWindowSec` is early, not stray.
  *
- *  3. The clock never passes the landing of a group that is not satisfied.
- *     The old logic let time run on for 150 ms before pausing, so on a pause
- *     the bars had already scrolled past the keys — short notes had vanished
- *     from the screen while the game still waited for them. Here the song
- *     position is clamped to the group's landing, so what is being asked for is
- *     exactly what is touching the keyboard. A late player simply shifts the
- *     rest of the song by their lateness (wait mode), they are not left behind.
+ *  3. The clock does not run away from an unplayed group, and does not stall on
+ *     human timing noise. A note played within `lateGraceSec` of its bar
+ *     landing costs nothing: the song keeps flowing, so a few ms of jitter per
+ *     note cannot accumulate (measured on Maple Leaf Rag: stopping the clock
+ *     the instant a bar landed made the song 18-31% slow; ~800 stalls of a few
+ *     ms each, none of them ever made up). Past the grace the clock stops at a
+ *     fixed point just after the landing and the caller pins the asked-for bars
+ *     to the keys, so what the game waits for is exactly what is on the keys
+ *     (it used to wait for bars that had scrolled out of sight). A genuinely
+ *     late player then shifts the rest of the song by how late they were
+ *     beyond the grace (wait mode); they are not left behind.
  */
 
 export const GATE_DEFAULTS = {
   windowTicks: 15,       // entries this close together are one chord
   releaseGraceSec: 0.35, // a finished note may be held this much longer without counting as a stray key
   earlyWindowSec: 0.15,  // a key for a note landing within this long is "early", not a stray key
-  waitUiMs: 120,         // stall this long before showing "Waiting for…" (sub-120 ms lateness is invisible)
+  waitUiMs: 0,           // extra debounce before showing "Waiting for…" (the grace already delays it)
+  lateGraceSec: 0.12,    // how late past its landing a note may be played before the song waits
+  simulWindowMs: 250,    // a chord's keys need not be down at the same instant: one pressed
+                         // and let go this recently (a short note, or an early one) still counts
 }
 
 export class PracticeSession {
@@ -40,26 +47,33 @@ export class PracticeSession {
     this.pressed = new Map()   // key -> presses not yet used to confirm a note (counted: two quick
                                // presses of one key are two notes, not one)
     this.confirmedTick = -1    // every entry at or before this tick is done
+    this.offAt = new Map()     // key -> wall ms it was last let go
     this.blockedSinceMs = null // when the current group first failed to be satisfied
     this.waitingShown = false
+    this._nowMs = 0
   }
 
   reset() {
     this.held.clear()
     this.pressed.clear()
+    this.offAt.clear()
     this.confirmedTick = -1
     this.blockedSinceMs = null
     this.waitingShown = false
   }
 
   /** Forget all key state (device change, mode toggle) without losing progress. */
-  clearKeys() { this.held.clear(); this.pressed.clear() }
+  clearKeys() { this.held.clear(); this.pressed.clear(); this.offAt.clear() }
 
   noteOn(midi) {
     this.held.add(midi)
+    this.offAt.delete(midi)
     this.pressed.set(midi, Math.min(4, (this.pressed.get(midi) || 0) + 1))
   }
-  noteOff(midi) { this.held.delete(midi) }
+  /** @param {number} midi  @param {number} [atMs]  wall ms (defaults to the last step's clock) */
+  noteOff(midi, atMs) {
+    if (this.held.delete(midi)) this.offAt.set(midi, atMs ?? this._nowMs)
+  }
 
   /**
    * One frame of practice logic.
@@ -74,7 +88,9 @@ export class PracticeSession {
    * @returns {{
    *   required: Set<number>,         notes asked for right now (empty = nothing due)
    *   groupTick: number|null,
-   *   landSec: number|null,          where the clock must stop while unsatisfied
+   *   landSec: number|null,          when the bars of this group touch the keys
+   *   holdAt: number|null,           where the clock stops if the group is still unplayed
+   *   overdue: boolean,              the grace is used up: stop the clock at holdAt
    *   state: 'idle'|'satisfied'|'building'|'blocked',
    *   confirmed: boolean,            this frame confirmed the group
    *   missing: number[], extras: number[],
@@ -82,10 +98,11 @@ export class PracticeSession {
    * }}
    */
   step({ timeline, nowSec, startSec, endSec, noteMidi, nowMs }) {
-    const { windowTicks, releaseGraceSec, earlyWindowSec, waitUiMs } = this.o
+    const { windowTicks, releaseGraceSec, earlyWindowSec, waitUiMs, lateGraceSec, simulWindowMs } = this.o
+    this._nowMs = nowMs
     const required = new Set()
     const out = {
-      required, groupTick: null, landSec: null, state: 'idle', confirmed: false,
+      required, groupTick: null, landSec: null, holdAt: null, overdue: false, state: 'idle', confirmed: false,
       missing: [], extras: [], showWaiting: false,
     }
     if (!timeline || timeline.length === 0) return this._idle(out)
@@ -103,6 +120,7 @@ export class PracticeSession {
 
     out.groupTick = first.tick
     out.landSec = startSec(first)
+    out.holdAt = out.landSec + lateGraceSec
     for (let i = 0; i < timeline.length; i++) {
       const e = timeline[i]
       if (e.tick < first.tick - 5) continue
@@ -131,7 +149,10 @@ export class PracticeSession {
     }
 
     const missing = []
-    const fresh = (m) => this.held.has(m) && (this.pressed.get(m) || 0) > 0
+    // Played = pressed since last used AND either still down or only just let go
+    // (a short or early note can be gone before its chord partner arrives).
+    const fresh = (m) => (this.pressed.get(m) || 0) > 0
+      && (this.held.has(m) || (this.offAt.has(m) && nowMs - this.offAt.get(m) <= simulWindowMs))
     for (const m of required) if (!fresh(m)) missing.push(m)
     const extras = []
     for (const m of this.held) if (!required.has(m) && !sounding.has(m)) extras.push(m)
@@ -155,6 +176,13 @@ export class PracticeSession {
     }
 
     out.state = extras.length === 0 && [...required].some(fresh) ? 'building' : 'blocked'
+    // Within the grace the song just keeps flowing — nothing to wait for yet.
+    out.overdue = nowSec >= out.holdAt
+    if (!out.overdue) {
+      this.blockedSinceMs = null
+      this.waitingShown = false
+      return out
+    }
     if (this.blockedSinceMs === null) this.blockedSinceMs = nowMs
     out.showWaiting = nowMs - this.blockedSinceMs >= waitUiMs
     this.waitingShown = out.showWaiting

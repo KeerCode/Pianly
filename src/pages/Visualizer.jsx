@@ -434,6 +434,7 @@ export default function Visualizer() {
     // clock stops exactly on its landing, so the bars on screen are the ones the
     // game is waiting for (they used to scroll past during a 150 ms grace).
     const practMode_ = practiceModeRef.current
+    let pinGroupTick = null   // while stopped, the asked-for bars stay on the keys
     if (practMode_ && ps.timeline && ps.timeline.length > 0) {
       const startSecOf = (e) => tickToSec(e.tick) + leadInSec
       const endSecOf = (e) => startSecOf(e) + (e.durationSec != null
@@ -451,16 +452,20 @@ export default function Visualizer() {
       // Only the running song (or one the gate itself stopped) is gated; a user
       // pause or a song that has not started is left alone.
       const gated = ps.playing || practicePausedRef.current
-      if (g.required.size > 0 && g.state !== 'satisfied' && gated) {
+      // `overdue`: the player is later than the lateness grace (see practiceGate).
+      // Inside the grace the song just keeps flowing, so a few ms of timing noise
+      // per note cannot add up to a slower song.
+      if (g.required.size > 0 && g.state !== 'satisfied' && g.overdue && gated) {
         if (ps.playing) {
           ps.playing = false
-          ps.pausedAt = g.landSec
-          ps.elapsed = g.landSec
+          ps.pausedAt = g.holdAt
+          ps.elapsed = g.holdAt
           ps.audioStartTime = null
           ps.startTime = 0
           practicePausedRef.current = true
-          currentTimeSec = g.landSec
+          currentTimeSec = g.holdAt
         }
+        pinGroupTick = g.groupTick
         const releasing = g.missing.length === 0 && g.extras.length > 0
         const names = (releasing ? g.extras : g.missing.length ? g.missing : [...g.required]).map(midiToNoteName)
         targetMidiRef.current = new Set(releasing ? [] : g.missing.length ? g.missing : g.required)
@@ -491,6 +496,12 @@ export default function Visualizer() {
       }
     }
 
+    // Dev-only read-out of the song clock, so tools/paceSim-style players can
+    // follow the bars in a real run. Not present in production builds.
+    if (import.meta.env.DEV) {
+      window.__vizClock = { song: currentTimeSec - leadInSec, playing: ps.playing, waiting: practicePausedRef.current, speed, pinGroupTick }
+    }
+
     const activeKeys = {}
 
     if (ps.timeline && ps.timeline.length > 0) {
@@ -500,7 +511,11 @@ export default function Visualizer() {
         const noteDurSec = entry.durationSec != null
           ? entry.durationSec / speed
           : tickToSec(entry.tick + entry.duration) - tickToSec(entry.tick)
-        const timeUntilLand = noteStartSec - currentTimeSec
+        let timeUntilLand = noteStartSec - currentTimeSec
+        // The notes being waited for stay exactly on the keys, even though the
+        // clock stopped a little after they landed (a short bar would otherwise
+        // have scrolled out of sight while still being asked for).
+        if (pinGroupTick !== null && entry.tick >= pinGroupTick - 5 && entry.tick <= pinGroupTick + CHORD_TICK_WINDOW && timeUntilLand < 0) timeUntilLand = 0
         const barBottom = keyboardTop - timeUntilLand * FALL_PX_PER_SEC
         const barH = Math.max(noteDurSec * FALL_PX_PER_SEC, 6)
         const barTop = barBottom - barH

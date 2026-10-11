@@ -8,6 +8,7 @@ import { DEMO_PIECES, loadDemoScore } from '../data/demoScores'
 import { noteNameToMidi, getInterval } from '../utils/noteConversion'
 import { getSavedFolder, pickFolder, listScores, loadScore } from '../lib/scoreFolder'
 import { enableMidi, listenToDevice, notesMatch, onDevicesChanged } from '../input/midiInput'
+import { MidiStepGate } from '../practice/midiStepGate'
 import { startPredictiveDetection } from '../input/predictiveDetector'
 import MicSetup from '../MicSetup'
 import { useMicCalibration, calibrationStatus } from '../useMicCalibration'
@@ -91,7 +92,6 @@ function injectSystemBreaksAtTimeSigChange(xmlStr) {
   }
 }
 
-const ADVANCE_COOLDOWN_MS = 150
 // Mic only: after advancing on a match, the note we just matched is still
 // ringing. It (and its harmonic/octave shadows) is ignored until it stops, is re-struck, or a new
 // correct-looking note appears; this caps how long evaluation of the next
@@ -209,7 +209,6 @@ function App() {
   const setExpectedRef = useRef(null)   // predictive detector's setExpected(midis), while mic practice is running
   const captureTakeRef = useRef(null)   // predictive detector's captureTake(), same lifetime
   const lastMicDebugAtRef = useRef(0)
-  const advanceCooldownRef = useRef(false)
   const wrongTimerRef = useRef(null)
 
   const currentNoteIndexRef = useRef(0)
@@ -220,6 +219,10 @@ function App() {
   const modeRef = useRef('idle')
   const heldNotesRef = useRef(new Set())
   const waitingForReleaseRef = useRef(false) // true = correct note played, waiting for release to advance (MIDI)
+  // MIDI step gate: which keys count for the current step, which are left over
+  // from steps already accepted (see src/practice/midiStepGate.js).
+  const midiGateRef = useRef(null)
+  if (midiGateRef.current === null) midiGateRef.current = new MidiStepGate((a, b, any) => notesMatch(a, b, any))
   const inputModeRef = useRef('midi')
   const staleNotesRef = useRef(new Map())    // mic: note key -> time it was last missing (null = still heard); the note we just advanced past
   const evalBlockedRef = useRef(false)       // mic: hold off judging the next target until the old sound clears
@@ -612,23 +615,18 @@ function App() {
 
   // Advance to the next note, skipping any tied notes
   const doAdvance = useCallback(() => {
-    // The cooldown guards MIDI against re-triggering on one press. For the mic
-    // it does harm: the detector only re-notifies when the held set changes, so
-    // a fast next note detected inside the window would be dropped and wait
-    // for the following change. The mic's ring-over tracking prevents the
-    // double-advance instead.
-    if (inputModeRef.current !== 'mic') {
-      advanceCooldownRef.current = true
-      setTimeout(() => { advanceCooldownRef.current = false }, ADVANCE_COOLDOWN_MS)
-    }
-
-    let nextIdx = currentNoteIndexRef.current + 1
+    // No re-trigger cooldown: a step completes the moment its keys are down and
+    // those keys then count as old until let go (MidiStepGate / the mic's
+    // ring-over tracking), so one press can't advance twice. The old 150 ms
+    // cooldown silently dropped the next note when it arrived inside it - a
+    // sixteenth note at 100 bpm is exactly 150 ms.
+    const nextIdx = currentNoteIndexRef.current + 1
     const tl = noteTimelineRef.current
 
-    // Auto-skip tied notes (notes connected by curves)
-    while (nextIdx < tl.length && nextIdx > 0 && tl[nextIdx - 1].isTied) {
-      nextIdx++
-    }
+    // (Tie continuations are not in the timeline - the parser drops them - so
+    // there is nothing to skip; the entry after a tied one is a real step. The
+    // old skip jumped over chords: on Maple Leaf Rag the player was asked for
+    // notes later than the cursor showed.)
 
     if (nextIdx >= tl.length) {
       setCompleted(true)
@@ -681,6 +679,7 @@ function App() {
   }
   const resetRingOver = () => {
     staleNotesRef.current = new Map()
+    midiGateRef.current.clear()
     endRingOverBlock()
   }
   // Is this detected note the OLD sound (still ringing, or its shadow) rather
@@ -737,11 +736,35 @@ function App() {
   const checkNotes = useCallback(() => {
     if (completedRef.current || pausedRef.current) return
     if (modeRef.current !== 'practice') return
-    if (advanceCooldownRef.current) return
 
     const idx = currentNoteIndexRef.current
     const target = noteTimelineRef.current[idx]
     if (!target) return
+
+    if (inputModeRef.current === 'midi') {
+      const next = noteTimelineRef.current[idx + 1]
+      const r = midiGateRef.current.evaluate(target.notes, anyOctaveRef.current, next?.notes ?? null, performance.now())
+      if (r === 'complete') {
+        clearTimeout(wrongTimerRef.current)
+        wrongTimerRef.current = null
+        setShowHint(false)
+        wrongCountRef.current = 0
+        doAdvance()
+      } else if (r === 'wrong') {
+        wrongCountRef.current++
+        if (wrongCountRef.current >= MAX_WRONG_ATTEMPTS) {
+          setShowHint(true)
+          playTargetHint()
+          wrongCountRef.current = 0
+        } else if (!wrongTimerRef.current) {
+          wrongTimerRef.current = setTimeout(() => {
+            wrongTimerRef.current = null
+            setShowHint(true)
+          }, HINT_DELAY_MS)
+        }
+      }
+      return
+    }
 
     if (evalBlockedRef.current) return
 
@@ -815,6 +838,7 @@ function App() {
   }, [doAdvance])
 
   const handleNoteOff = useCallback((note) => {
+    midiGateRef.current.noteOff(note, performance.now())
     heldNotesRef.current.delete(note)
     if (heldNotesRef.current.size === 0) {
       setDetectedNote(null)
@@ -822,7 +846,15 @@ function App() {
     } else {
       setDetectedNote([...heldNotesRef.current].join(' + '))
     }
-  }, [handleRelease])
+    // Letting go of a stray key (or a chord note) can be what completes a step.
+    if (inputModeRef.current === 'midi') checkNotes()
+  }, [handleRelease, checkNotes])
+
+  // The cursor moved: keys already down for the new step (played a little early)
+  // are judged straight away instead of waiting for the next key event.
+  useEffect(() => {
+    if (mode === 'practice' && inputMode === 'midi') checkNotes()
+  }, [currentNoteIndex]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Auto-reconnect MIDI when device changes mid-practice
   useEffect(() => {
@@ -836,6 +868,7 @@ function App() {
       const stop = await listenToDevice(
         selectedDeviceId,
         (note) => {
+          midiGateRef.current.noteOn(note, performance.now())
           heldNotesRef.current.add(note)
           setDetectedNote([...heldNotesRef.current].join(' + '))
           checkNotes()
