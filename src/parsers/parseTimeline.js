@@ -31,6 +31,7 @@ export function tickToSec(tick, tempoMap) {
  * Tied notes are one entry whose duration spans the whole tie chain.
  * Ticks/durations are scaled to 960-per-quarter for AlphaTab compatibility.
  * Parses all <part> elements — first part = right hand, second = left hand.
+ * Within a part, notes on staff 2 and up (the bass staff of a piano part) are left hand.
  * tempoMap is [{ tick, bpm }] tracking all mid-piece tempo changes.
  */
 export function parseNoteTimeline(xmlString, defaultBpm = 120) {
@@ -117,7 +118,7 @@ export function parseNoteTimeline(xmlString, defaultBpm = 120) {
   }
 
   parts.forEach((part, partIndex) => {
-    const hand = partIndex === 0 ? 'right' : 'left'
+    const partHand = partIndex === 0 ? 'right' : 'left'
     const measures = part.querySelectorAll('measure')
     let currentTick = 0
     let divisions = 1
@@ -151,6 +152,9 @@ export function parseNoteTimeline(xmlString, defaultBpm = 120) {
         const isChord = !!el.querySelector('chord')
 
         if (el.querySelector('grace')) continue
+
+        const staff = parseInt(el.querySelector('staff')?.textContent) || 1
+        const hand = staff >= 2 ? 'left' : partHand
 
         if (!isRest) {
           const pitchEl = el.querySelector('pitch')
