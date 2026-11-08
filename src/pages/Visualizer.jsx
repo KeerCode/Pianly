@@ -1,15 +1,14 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { unzipSync } from 'fflate'
 import { parseNoteTimeline, tickToSec as tempoMapTickToSec } from '../parsers/parseTimeline'
+import { PracticeSession } from '../practice/practiceGate'
 import { parseMidiFile } from '../parsers/parseMidi'
 import { DEMO_PIECES, loadDemoScore } from '../data/demoScores'
-import { getSavedFolder, pickFolder, listScores, loadScore } from '../lib/scoreFolder'
 import { SplendidGrandPiano } from 'smplr'
 import { enableMidi } from '../input/midiInput'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import Background from '../Background'
-import { useTheme } from '../ThemeContext'
 import { midiToNoteName, noteNameToMidi } from '../utils/noteConversion'
 
 // ---------------------------------------------------------------------------
@@ -110,8 +109,9 @@ function createSynth() {
 const DEFAULT_RIGHT_COLOR = '#3b82f6'
 const DEFAULT_LEFT_COLOR  = '#22c55e'
 const DEFAULT_PLAYBACK_SPEED = 1.0
-const FALL_PX_PER_SEC = 200
-const GRACE_MS = 150       // ms before practice pause triggers
+const FALL_PX_PER_SEC = 200   // pixels per second of SCORE time; the speed setting changes how
+                              // fast score time passes, so bars fall slower/faster, same length
+const REWIND_MS = 160         // how long the sheet takes to ease back to a missed note
 const CHORD_TICK_WINDOW = 15  // ticks — entries within this range are one chord
 
 // ---------------------------------------------------------------------------
@@ -124,8 +124,6 @@ function getDefaultBpm() {
 }
 
 export default function Visualizer() {
-  const { theme } = useTheme()
-
   // ── Watch mode state ───────────────────────────────────────────────────────
   const [musicXml, setMusicXml] = useState(null)
   const [filename, setFilename] = useState('')
@@ -147,15 +145,9 @@ export default function Visualizer() {
   const [practiceWaiting, setPracticeWaiting] = useState(false) // true = waiting for first keypress to start
   const [practiceStatus, setPracticeStatus] = useState('playing') // 'playing' | 'waiting'
   const [targetNoteNames, setTargetNoteNames] = useState([])     // e.g. ['C4', 'E4']
+  const [blockKind, setBlockKind] = useState('play')               // 'play' = notes still needed, 'release' = key to let go of
   const [midiDevices, setMidiDevices] = useState([])
   const [selectedDeviceId, setSelectedDeviceId] = useState(null)
-
-  // ── Library state ─────────────────────────────────────────────────────────
-  const [showLibrary, setShowLibrary] = useState(false)
-  const [libraryTab, setLibraryTab] = useState('mysongs') // 'mysongs' | 'demos'
-  const [folderPath, setFolderPath] = useState(() => getSavedFolder())
-  const [folderScores, setFolderScores] = useState([])
-  const [folderLoading, setFolderLoading] = useState(false)
 
   // ── Refs ──────────────────────────────────────────────────────────────────
   const canvasRef      = useRef(null)
@@ -163,16 +155,26 @@ export default function Visualizer() {
   const animRef        = useRef(null)
   const synthRef       = useRef(null)
   const playedNotesRef = useRef(new Set())
-  const playStateRef   = useRef({ playing: false, startTime: 0, elapsed: 0, pausedAt: 0, audioStartTime: null })
+  // elapsed / pausedAt are SCORE seconds; they advance at `speed` per real second.
+  const playStateRef   = useRef({ playing: false, startTime: 0, elapsed: 0, pausedAt: 0, audioStartTime: null, speed: 1 })
   const settingsRef    = useRef({ playbackSpeed: DEFAULT_PLAYBACK_SPEED, rightColor: DEFAULT_RIGHT_COLOR, leftColor: DEFAULT_LEFT_COLOR, showNoteNames: true, showKeyLabels: true, soundEnabled: true })
 
   // Practice refs (read inside draw loop — must be refs not state)
-  const heldMidiRef       = useRef(new Set())   // MIDI notes currently held by user
+  // The gate owns key state and progress (see src/practice/practiceGate.js). The
+  // refs below are views onto it so the rest of this file keeps working.
+  const sessionRef = useRef(null)
+  if (sessionRef.current === null) sessionRef.current = new PracticeSession()
+  const heldMidiRef       = useRef(sessionRef.current.held)   // MIDI notes currently held by user
   const practiceModeRef   = useRef(false)        // mirror of practiceMode state
   const practicePausedRef = useRef(false)        // true when practice auto-paused
+  const rewindRef         = useRef(null)         // { from, to, startMs }: the sheet easing back to a missed note
   const targetMidiRef     = useRef(new Set())    // notes user must press to resume
-  const confirmedTickRef  = useRef(-1)           // highest musical tick confirmed so far
-  const graceStartRef     = useRef(null)         // rAF timestamp when grace window opened
+  // highest musical tick confirmed so far — lives in the session
+  const confirmedTickRef  = useMemo(() => ({
+    get current() { return sessionRef.current.confirmedTick },
+    set current(v) { sessionRef.current.confirmedTick = v },
+  }), [])
+  const targetKeyRef      = useRef('')           // last target-name list pushed to the UI (gate thrash)
   const midiStopRef       = useRef(null)         // MIDI unlisten/disconnect fn
   const lastStatusRef     = useRef('playing')    // gate setPracticeStatus to avoid thrash
   const practiceWaitingRef = useRef(false)       // mirror of practiceWaiting for use inside MIDI handler
@@ -228,10 +230,10 @@ export default function Visualizer() {
 
   // ── Reset practice tracking when file changes ─────────────────────────────
   useEffect(() => {
-    confirmedTickRef.current = -1
+    sessionRef.current.reset()
     practicePausedRef.current = false
+    rewindRef.current = null
     targetMidiRef.current = new Set()
-    graceStartRef.current = null
     lastStatusRef.current = 'playing'
     setPracticeStatus('playing')
     setTargetNoteNames([])
@@ -313,7 +315,7 @@ export default function Visualizer() {
           const noteName = event.payload?.note ?? event.payload
           const midi = noteNameToMidi(String(noteName))
           if (midi != null) {
-            heldMidiRef.current.add(midi)
+            sessionRef.current.noteOn(midi)
             if (practiceWaitingRef.current) {
               practiceWaitingRef.current = false
               setPracticeWaiting(false)
@@ -331,7 +333,7 @@ export default function Visualizer() {
         unlistenOff = await listen('midi-note-off', (event) => {
           const noteName = event.payload?.note ?? event.payload
           const midi = noteNameToMidi(String(noteName))
-          if (midi != null) heldMidiRef.current.delete(midi)
+          if (midi != null) sessionRef.current.noteOff(midi)
         })
       } catch (err) {
         console.error('[Visualizer] listen(midi-note-off) failed:', err)
@@ -353,17 +355,17 @@ export default function Visualizer() {
       cancelled = true
       unlistenOn?.(); unlistenOff?.()
       invoke('disconnect_midi').catch(() => {})
-      heldMidiRef.current.clear()
+      sessionRef.current.clearKeys()
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Practice mode teardown (clear practice state when toggled off) ────────
   useEffect(() => {
     if (!practiceMode) {
-      heldMidiRef.current.clear()
+      sessionRef.current.clearKeys()
       practicePausedRef.current = false
+      rewindRef.current = null
       targetMidiRef.current = new Set()
-      graceStartRef.current = null
       if (lastStatusRef.current !== 'playing') {
         lastStatusRef.current = 'playing'
         setPracticeStatus('playing')
@@ -396,21 +398,35 @@ export default function Visualizer() {
 
     if (ps.playing) {
       const audioCtx = synthRef.current?.getCtx?.()
+      // Real seconds since play/resume, from the audio clock when there is one
+      // (visuals and audio stay locked), else from rAF timestamps.
+      let realSec
       if (audioCtx && ps.audioStartTime != null) {
-        // Use audio clock as the single source of truth — visuals and audio stay locked
-        ps.elapsed = (audioCtx.currentTime - ps.audioStartTime) + ps.pausedAt
+        realSec = audioCtx.currentTime - ps.audioStartTime
       } else {
-        // Fallback when sound is off: use rAF timestamps
         if (ps.startTime === 0) ps.startTime = timestamp
-        ps.elapsed = (timestamp - ps.startTime) / 1000 + ps.pausedAt
+        realSec = (timestamp - ps.startTime) / 1000
       }
+      ps.elapsed = ps.pausedAt + realSec * ps.speed
+      if (speed !== ps.speed) {
+        // Speed changed while playing: keep the position, change only the rate.
+        ps.pausedAt = ps.elapsed
+        ps.speed = speed
+        if (audioCtx && ps.audioStartTime != null) ps.audioStartTime = audioCtx.currentTime
+        else ps.startTime = timestamp
+      }
+    } else {
+      ps.speed = speed
     }
-    const currentTimeSec = ps.elapsed
+    let currentTimeSec = ps.elapsed
 
     const whiteKeyH = Math.max(h * WHITE_KEY_H_RATIO, 60)
     const blackKeyH = whiteKeyH * BLACK_KEY_H_RATIO
     const layout = buildKeyLayout(w)
     const keyboardTop = h - whiteKeyH
+    // Everything below is in score seconds: one second of score is always
+    // FALL_PX_PER_SEC pixels, and the speed setting only changes how fast the
+    // clock above moves through it (bars fall slower or faster, same length).
     const leadInSec = keyboardTop / FALL_PX_PER_SEC
 
     const rColorDark = darkenColor(rColor, 0.5)
@@ -420,7 +436,83 @@ export default function Visualizer() {
     ctx.fillRect(0, 0, w, h)
 
     const tMap = ps.tempoMap || [{ tick: 0, bpm: ps.tempo || 120 }]
-    const tickToSec = (tick) => tempoMapTickToSec(tick, tMap) / speed
+    const tickToSec = (tick) => tempoMapTickToSec(tick, tMap)
+
+    // Status bar + pulsing key outlines for what the stopped song is waiting for.
+    const showWaitingFor = (g) => {
+      const releasing = g.missing.length === 0 && g.extras.length > 0
+      const wanted = releasing ? [] : g.missing.length ? g.missing : [...g.required]
+      const names = (releasing ? g.extras : wanted).map(midiToNoteName)
+      targetMidiRef.current = new Set(wanted)
+      const key = (releasing ? 'release:' : 'play:') + names.join(',')
+      if (lastStatusRef.current !== 'waiting' || key !== targetKeyRef.current) {
+        lastStatusRef.current = 'waiting'
+        targetKeyRef.current = key
+        setPracticeStatus('waiting')
+        setBlockKind(releasing ? 'release' : 'play')
+        setTargetNoteNames(names)
+      }
+    }
+
+    // ── Practice gate ───────────────────────────────────────────────────────
+    // Runs before any bar is drawn. A note played within the lateness grace
+    // costs nothing (see practiceGate). Later than that, the song stops and the
+    // whole sheet eases back to the moment the missed notes touched the keys,
+    // then waits there until they are played.
+    let drawTimeSec = currentTimeSec
+    if (practiceModeRef.current && ps.timeline && ps.timeline.length > 0) {
+      const startSecOf = (e) => tickToSec(e.tick) + leadInSec
+      const endSecOf = (e) => startSecOf(e) + (e.durationSec != null
+        ? e.durationSec
+        : tickToSec(e.tick + e.duration) - tickToSec(e.tick))
+      const g = sessionRef.current.step({
+        timeline: ps.timeline,
+        nowSec: currentTimeSec,
+        startSec: startSecOf,
+        endSec: endSecOf,
+        noteMidi: noteNameToMidi,
+        nowMs: timestamp,
+      })
+      const done = g.state === 'satisfied' || g.required.size === 0
+
+      if (practicePausedRef.current) {
+        if (done) {
+          practicePausedRef.current = false
+          rewindRef.current = null
+          targetMidiRef.current = new Set()
+          ps.playing = true
+          ps.startTime = 0
+        } else {
+          showWaitingFor(g)
+        }
+      } else if (ps.playing && !done && g.overdue) {
+        // A user pause (ps.playing false) is never gated.
+        ps.playing = false
+        ps.pausedAt = g.landSec
+        ps.elapsed = g.landSec
+        ps.audioStartTime = null
+        ps.startTime = 0
+        practicePausedRef.current = true
+        rewindRef.current = { from: currentTimeSec, to: g.landSec, startMs: timestamp }
+        currentTimeSec = g.landSec
+        synthRef.current?.stopAll()
+        showWaitingFor(g)
+      }
+      if (!practicePausedRef.current && lastStatusRef.current !== 'playing') {
+        lastStatusRef.current = 'playing'
+        targetKeyRef.current = ''
+        setPracticeStatus('playing')
+        setTargetNoteNames([])
+      }
+      const rw = rewindRef.current
+      if (rw) {
+        const k = Math.min(1, (timestamp - rw.startMs) / REWIND_MS)
+        drawTimeSec = rw.from + (rw.to - rw.from) * (1 - Math.pow(1 - k, 3)) // ease out
+        if (k >= 1) rewindRef.current = null
+      } else {
+        drawTimeSec = currentTimeSec
+      }
+    }
 
     const activeKeys = {}
 
@@ -429,9 +521,9 @@ export default function Visualizer() {
         const entry = ps.timeline[ei]
         const noteStartSec = tickToSec(entry.tick) + leadInSec
         const noteDurSec = entry.durationSec != null
-          ? entry.durationSec / speed
+          ? entry.durationSec
           : tickToSec(entry.tick + entry.duration) - tickToSec(entry.tick)
-        const timeUntilLand = noteStartSec - currentTimeSec
+        const timeUntilLand = noteStartSec - drawTimeSec
         const barBottom = keyboardTop - timeUntilLand * FALL_PX_PER_SEC
         const barH = Math.max(noteDurSec * FALL_PX_PER_SEC, 6)
         const barTop = barBottom - barH
@@ -483,86 +575,11 @@ export default function Visualizer() {
       }
     }
 
-    // ── Practice mode logic ─────────────────────────────────────────────────
+    // Practice gating happened above, before the bars were drawn.
     const practMode = practiceModeRef.current
     const heldMidi = heldMidiRef.current
     const practicePaused = practicePausedRef.current
     const targetMidi = targetMidiRef.current
-    let requiredMidi = new Set()
-
-    if (practMode && ps.timeline && ps.timeline.length > 0) {
-      // Find the first unconfirmed tick that has landed
-      let firstUnconfirmedTick = Infinity
-      for (const entry of ps.timeline) {
-        if (entry.tick <= confirmedTickRef.current) continue
-        const noteStartSec = tickToSec(entry.tick) + leadInSec
-        if (noteStartSec <= currentTimeSec + 0.02) {
-          firstUnconfirmedTick = entry.tick
-          break // timeline sorted by tick — first match is earliest
-        }
-      }
-
-      // Collect all MIDI notes in this chord group (within CHORD_TICK_WINDOW)
-      if (firstUnconfirmedTick < Infinity) {
-        for (const entry of ps.timeline) {
-          if (entry.tick < firstUnconfirmedTick - 5) continue
-          if (entry.tick > firstUnconfirmedTick + CHORD_TICK_WINDOW) break
-          const noteStartSec = tickToSec(entry.tick) + leadInSec
-          if (noteStartSec <= currentTimeSec + 0.02) {
-            for (const n of entry.notes) {
-              const m = noteNameToMidi(n)
-              if (m != null) requiredMidi.add(m)
-            }
-          }
-        }
-      }
-
-      const allHeld  = requiredMidi.size === 0 || [...requiredMidi].every(m => heldMidi.has(m))
-      // true if every held note is a valid target (user is building the chord correctly)
-      const noExtras = [...heldMidi].every(m => requiredMidi.has(m))
-
-
-      if (allHeld && noExtras && requiredMidi.size > 0) {
-        // All required notes held and no extras — confirm chord
-        confirmedTickRef.current = firstUnconfirmedTick + CHORD_TICK_WINDOW
-        graceStartRef.current = null
-        if (practicePaused) {
-          practicePausedRef.current = false
-          targetMidiRef.current = new Set()
-          ps.playing = true
-          ps.startTime = 0
-          if (lastStatusRef.current !== 'playing') {
-            lastStatusRef.current = 'playing'
-            setPracticeStatus('playing')
-            setTargetNoteNames([])
-          }
-        }
-      } else if (!allHeld && noExtras && heldMidi.size > 0 && requiredMidi.size > 0) {
-        // User is building the chord correctly (all held notes are valid targets,
-        // just not all pressed yet). Reset grace timer — don't penalise.
-        graceStartRef.current = null
-      } else if (requiredMidi.size > 0 && ps.playing) {
-        // Wrong/extra key held, no keys held, or missing notes with extras — grace timer then pause
-        if (graceStartRef.current === null) {
-          graceStartRef.current = timestamp
-        } else if (timestamp - graceStartRef.current > GRACE_MS) {
-          graceStartRef.current = null
-          ps.playing = false
-          ps.pausedAt = ps.elapsed
-          ps.audioStartTime = null
-          practicePausedRef.current = true
-          targetMidiRef.current = new Set(requiredMidi)
-          synthRef.current?.stopAll()
-          if (lastStatusRef.current !== 'waiting') {
-            lastStatusRef.current = 'waiting'
-            setPracticeStatus('waiting')
-            setTargetNoteNames([...requiredMidi].map(midiToNoteName))
-          }
-        }
-      } else {
-        graceStartRef.current = null
-      }
-    }
 
     // Divider
     ctx.fillStyle = '#333'
@@ -658,9 +675,9 @@ export default function Visualizer() {
   // ── Playback handlers ─────────────────────────────────────────────────────
   function resetPracticeState() {
     practicePausedRef.current = false
+    rewindRef.current = null
     targetMidiRef.current = new Set()
-    confirmedTickRef.current = -1
-    graceStartRef.current = null
+    sessionRef.current.reset()
     if (lastStatusRef.current !== 'playing') {
       lastStatusRef.current = 'playing'
       setPracticeStatus('playing')
@@ -690,9 +707,8 @@ export default function Visualizer() {
       const whiteKeyH = Math.max(h * WHITE_KEY_H_RATIO, 60)
       const keyboardTop = h - whiteKeyH
       const leadInSec = keyboardTop / FALL_PX_PER_SEC
-      const speed = settingsRef.current.playbackSpeed
       const tMap = ps.tempoMap || [{ tick: 0, bpm: ps.tempo || 120 }]
-      const tts = (tick) => tempoMapTickToSec(tick, tMap) / speed
+      const tts = (tick) => tempoMapTickToSec(tick, tMap)
 
       // Find the first unconfirmed note that has already landed (or is landing)
       // at the current paused position
@@ -723,8 +739,8 @@ export default function Visualizer() {
 
       // Clear any lingering practice-pause state
       practicePausedRef.current = false
+      rewindRef.current = null
       targetMidiRef.current = new Set()
-      graceStartRef.current = null
       if (lastStatusRef.current !== 'playing') {
         lastStatusRef.current = 'playing'
         setPracticeStatus('playing')
@@ -745,7 +761,7 @@ export default function Visualizer() {
     const ps = playStateRef.current
     ps.playing = false; ps.pausedAt = ps.elapsed; ps.audioStartTime = null
     practicePausedRef.current = false
-    graceStartRef.current = null
+    rewindRef.current = null
     setPlaying(false)
     synthRef.current?.stopAll()
   }
@@ -763,12 +779,6 @@ export default function Visualizer() {
       if (animRef.current) cancelAnimationFrame(animRef.current)
       animRef.current = requestAnimationFrame(draw)
     }
-  }
-
-  function handleBack() {
-    handleStop()
-    synthRef.current?.close(); synthRef.current = null
-    setMusicXml(null); setFilename(''); setTimeline([])
   }
 
   // ── Practice toggle ───────────────────────────────────────────────────────
@@ -804,52 +814,6 @@ export default function Visualizer() {
     setShowDemoModal(false); setFilename(piece.title); handleStop()
     const data = await loadDemoScore(piece)
     setMusicXml(data)
-  }
-
-  // ── Library handlers ──────────────────────────────────────────────────────
-  async function refreshFolder(path) {
-    if (!path) return
-    setFolderLoading(true)
-    try {
-      const scores = await listScores(path)
-      setFolderScores(scores)
-    } catch (e) {
-      console.error('[Library] listScores failed:', e)
-      setFolderScores([])
-    } finally {
-      setFolderLoading(false)
-    }
-  }
-
-  async function openLibrary() {
-    setShowLibrary(true)
-    if (folderPath) await refreshFolder(folderPath)
-  }
-
-  async function handlePickFolder() {
-    const picked = await pickFolder()
-    if (!picked) return
-    setFolderPath(picked)
-    await refreshFolder(picked)
-  }
-
-  async function handleChangeFolder() {
-    const picked = await pickFolder()
-    if (!picked) return
-    setFolderPath(picked)
-    await refreshFolder(picked)
-  }
-
-  async function handleLoadFolderScore(score) {
-    setShowLibrary(false)
-    try {
-      const data = await loadScore(score)
-      handleStop()
-      setFilename(score.name.replace(/\.[^.]+$/, ''))
-      setMusicXml(data)
-    } catch (e) {
-      console.error('[Library] loadScore failed:', e)
-    }
   }
 
   // Keep handlePlayRef current so the MIDI handler (captured in a closure) can call it
@@ -993,7 +957,7 @@ export default function Visualizer() {
               : {background:'var(--panel)',borderBottom:'1px solid var(--border)'}}>
             {practiceStatus === 'waiting' ? (
               <span className="text-xs font-semibold" style={{color:'var(--ink)',opacity:.85}}>
-                Waiting for: {targetNoteNames.join(' + ')}
+                {blockKind === 'release' ? 'Let go of' : 'Waiting for'}: {targetNoteNames.join(' + ')}
               </span>
             ) : (
               <span className="text-xs font-medium" style={{color:'var(--ink)',opacity:.85}}>Playing</span>
@@ -1151,112 +1115,6 @@ export default function Visualizer() {
         </div>
       )}
 
-      {/* ── Library modal ─────────────────────────────────────────────────── */}
-      {showLibrary && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4"
-          onClick={(e) => { if (e.target === e.currentTarget) setShowLibrary(false) }}>
-          <div className="rounded-2xl w-full max-w-lg max-h-[80vh] flex flex-col p-5 sm:p-6"
-            style={{ background: 'var(--panel)', border: '1px solid var(--border)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
-
-            {/* Header */}
-            <div className="flex items-center justify-between mb-4 shrink-0">
-              <h2 className="text-lg font-bold" style={{color:'var(--ink)'}}>Song Library</h2>
-              <button onClick={() => setShowLibrary(false)} className="hover:text-white transition-colors cursor-pointer" style={{color:'var(--sub)'}} aria-label="Close">
-                <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M15 5L5 15M5 5l10 10" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>
-              </button>
-            </div>
-
-            {/* Tabs */}
-            <div className="flex gap-1 mb-4 shrink-0 rounded-lg p-1" style={{background:'rgba(0,255,200,0.04)'}}>
-              {[['mysongs', 'My Scores'], ['demos', 'Demo Pieces']].map(([tab, label]) => (
-                <button key={tab} onClick={() => setLibraryTab(tab)}
-                  className="flex-1 py-1.5 rounded-md text-xs font-semibold transition-colors cursor-pointer"
-                  style={libraryTab === tab ? {background:'var(--accent)',color:'#000'} : {color:'var(--sub)'}}>
-                  {label}
-                </button>
-              ))}
-            </div>
-
-            {/* Content */}
-            <div className="flex-1 overflow-y-auto min-h-0">
-              {libraryTab === 'mysongs' && (
-                <div className="flex flex-col gap-2">
-                  {!folderPath ? (
-                    <div className="flex flex-col items-center gap-3 py-10 text-center">
-                      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" style={{color:'var(--sub)'}}><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
-                      <p className="text-sm" style={{color:'var(--sub)'}}>No scores folder set.<br/>Pick a folder containing your MusicXML files.</p>
-                      <button onClick={handlePickFolder}
-                        className="px-5 py-2.5 rounded-xl text-sm font-bold cursor-pointer"
-                        style={{background:'var(--accent)',color:'#000'}}>
-                        Choose Scores Folder
-                      </button>
-                    </div>
-                  ) : (
-                    <>
-                      <div className="flex items-center justify-between mb-1 gap-2">
-                        <p className="text-xs truncate flex-1" style={{color:'var(--sub)'}} title={folderPath}>{folderPath}</p>
-                        <div className="flex gap-1 shrink-0">
-                          <button onClick={() => refreshFolder(folderPath)} title="Refresh"
-                            className="w-7 h-7 flex items-center justify-center rounded-lg hover:text-white hover:bg-white/10 transition-colors cursor-pointer" style={{color:'var(--sub)'}}>
-                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 102.13-9.36L1 10"/></svg>
-                          </button>
-                          <button onClick={handleChangeFolder}
-                            className="px-2.5 py-1 rounded-lg text-xs hover:text-white transition-colors cursor-pointer"
-                            style={{border:'1px solid var(--border)',color:'var(--sub)'}}>
-                            Change
-                          </button>
-                        </div>
-                      </div>
-                      {folderLoading ? (
-                        <p className="text-sm text-center py-8" style={{color:'var(--sub)'}}>Scanning folder…</p>
-                      ) : folderScores.length === 0 ? (
-                        <p className="text-sm text-center py-8" style={{color:'var(--sub)'}}>No valid score files found (.xml, .musicxml, .mxl, .mid).</p>
-                      ) : folderScores.map(score => (
-                        <div key={score.path} className="flex items-center justify-between p-3 rounded-xl transition-colors" style={{border:'1px solid var(--border)'}}>
-                          <div className="min-w-0 mr-3">
-                            <div className="font-medium text-sm truncate" style={{color:'var(--ink)'}}>{score.name.replace(/\.[^.]+$/, '')}</div>
-                            <div className="text-xs mt-0.5" style={{color:'var(--sub)'}}>{score.name.split('.').pop().toUpperCase()}</div>
-                          </div>
-                          <div className="flex items-center gap-2 shrink-0">
-                            <button onClick={() => handleLoadFolderScore(score)}
-                              className="px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer"
-                              style={{background:'var(--accent)',color:'#000'}}>
-                              Load
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </>
-                  )}
-                </div>
-              )}
-
-              {libraryTab === 'demos' && (
-                <div className="flex flex-col gap-2">
-                  {DEMO_PIECES.map(piece => (
-                    <div key={piece.id} className="flex items-center justify-between p-3 rounded-xl transition-colors" style={{border:'1px solid var(--border)'}}>
-                      <div className="min-w-0 mr-3">
-                        <div className="font-semibold text-sm truncate" style={{color:'var(--ink)'}}>{piece.title}</div>
-                        <div className="text-xs mt-0.5" style={{color:'var(--sub)'}}>{piece.composer}</div>
-                      </div>
-                      <div className="flex items-center gap-2 shrink-0">
-                        <span className="text-xs font-medium px-2 py-0.5 rounded-full" style={{background:'rgba(0,255,200,0.1)',color:'var(--ink)',border:'1px solid var(--border)'}}>
-                          {piece.difficulty}
-                        </span>
-                        <button onClick={() => { setShowLibrary(false); handleSelectDemo(piece) }}
-                          className="px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer"
-                          style={{background:'var(--accent)',color:'#000'}}>
-                          Load
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   )
 }

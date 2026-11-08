@@ -6,13 +6,13 @@ import * as Tone from 'tone'
 import { SplendidGrandPiano } from 'smplr'
 import { DEMO_PIECES, loadDemoScore } from '../data/demoScores'
 import { noteNameToMidi, getInterval } from '../utils/noteConversion'
-import { getSavedFolder, pickFolder, listScores, loadScore } from '../lib/scoreFolder'
+import { getSavedFolder, pickFolder } from '../lib/scoreFolder'
 import { enableMidi, listenToDevice, notesMatch, onDevicesChanged } from '../input/midiInput'
 import { startBasicPitchDetection, loadBasicPitchModel, isBasicPitchReady } from '../input/pitchDetector'
+import { StepGate } from '../practice/stepGate'
 import { parseNoteTimelineOSMD } from '../parsers/osmdParser'
 import { tickToSec } from '../parsers/parseTimeline'
 import Background from '../Background'
-import { useTheme } from '../ThemeContext'
 
 /** Unzip an MXL (ZIP) ArrayBuffer and return the inner MusicXML string. */
 function mxlToXml(buffer) {
@@ -72,7 +72,6 @@ function injectSystemBreaksAtTimeSigChange(xmlStr) {
   }
 }
 
-const ADVANCE_COOLDOWN_MS = 150
 const HINT_DELAY_MS = 3000
 const MAX_WRONG_ATTEMPTS = 3
 
@@ -96,11 +95,7 @@ function App() {
   const [showSheetPicker, setShowSheetPicker] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [showHomeSettings, setShowHomeSettings] = useState(false)
-  const [showLibrary, setShowLibrary] = useState(false)
-  const [libraryTab, setLibraryTab] = useState('mysongs')
   const [folderPath, setFolderPath] = useState(() => getSavedFolder())
-  const [folderScores, setFolderScores] = useState([])
-  const [folderLoading, setFolderLoading] = useState(false)
   const [showHint, setShowHint] = useState(false)
   const [bpm, setBpm] = useState(null)
   const [scoreBpm, setScoreBpm] = useState(null) // original tempo from the score
@@ -144,7 +139,6 @@ function App() {
 
   const stopListenerRef = useRef(null)
   const stopMicRef = useRef(null)
-  const advanceCooldownRef = useRef(false)
   const wrongTimerRef = useRef(null)
 
   const currentNoteIndexRef = useRef(0)
@@ -154,7 +148,14 @@ function App() {
   const anyOctaveRef = useRef(false)
   const modeRef = useRef('idle')
   const heldNotesRef = useRef(new Set())
-  const waitingForReleaseRef = useRef(false) // true = correct note played, waiting for release to advance
+  // Which notes of the current step have been played, and notes played early for
+  // the next one (see src/practice/stepGate.js). Shared by MIDI and the mic.
+  const stepGateRef = useRef(null)
+  if (stepGateRef.current === null) stepGateRef.current = new StepGate((a, b, any) => notesMatch(a, b, any))
+  // A completed step waits out its written time before the cursor moves:
+  // { timer, idx, due } while waiting, { idx, remaining } while paused, else null.
+  const stepWaitRef = useRef(null)
+  const micHeardRef = useRef(new Set()) // notes the mic reported last time (a note "is pressed" when it first appears)
   const wrongCountRef = useRef(0) // counts wrong attempts for current note
   const lastTickSetRef = useRef(-1)
   const autoscrollRef = useRef(true)
@@ -536,46 +537,19 @@ function App() {
   // Practice mode: advance on correct input
   // ---------------------------------------------------------------------------
 
-  // Advance to the next note, skipping any tied notes
+  // Move the cursor to the next step (or finish). Called when a step's written
+  // time is up — see startStepWait.
   const doAdvance = useCallback(() => {
-    advanceCooldownRef.current = true
-    setTimeout(() => { advanceCooldownRef.current = false }, ADVANCE_COOLDOWN_MS)
-
-    let nextIdx = currentNoteIndexRef.current + 1
-    const tl = noteTimelineRef.current
-
-    // Auto-skip tied notes (notes connected by curves)
-    while (nextIdx < tl.length && nextIdx > 0 && tl[nextIdx - 1].isTied) {
-      nextIdx++
-    }
-
-    if (nextIdx >= tl.length) {
+    const nextIdx = currentNoteIndexRef.current + 1
+    if (nextIdx >= noteTimelineRef.current.length) {
       setCompleted(true)
-    } else {
-      wrongCountRef.current = 0
-      setShowHint(false)
-      clearTimeout(wrongTimerRef.current)
-      wrongTimerRef.current = null
-
-      // If there's a significant time gap before the next note (i.e. a measure rest),
-      // wait that duration before advancing — cursor stays on the current note.
-      const prevEntry = tl[currentNoteIndexRef.current]
-      const nextEntry = tl[nextIdx]
-      const prevEnd = (prevEntry?.timeSec ?? 0) + (prevEntry?.durationSec ?? 0)
-      const gapMs = Math.max(0, ((nextEntry?.timeSec ?? 0) - prevEnd) * 1000)
-      const REST_THRESHOLD_MS = 400 // gaps shorter than this are notation artifacts, not rests
-
-      // Only wait if there is at least one completely empty measure between the two entries
-      // (i.e. both hands rest for an entire bar). If the next note is in the immediately
-      // following measure, the gap is just the tail of the current bar after its last note —
-      // a whole rest on the other hand doesn't mean pause; advance immediately.
-      const measuresSkipped = (nextEntry?.measure ?? 1) - (prevEntry?.measure ?? 1)
-      if (gapMs >= REST_THRESHOLD_MS && measuresSkipped > 1) {
-        setTimeout(() => setCurrentNoteIndex(nextIdx), gapMs)
-      } else {
-        setCurrentNoteIndex(nextIdx)
-      }
+      return
     }
+    wrongCountRef.current = 0
+    setShowHint(false)
+    clearTimeout(wrongTimerRef.current)
+    wrongTimerRef.current = null
+    setCurrentNoteIndex(nextIdx)
   }, [])
 
   // Play the target note(s) via SplendidGrandPiano as a hint
@@ -592,47 +566,65 @@ function App() {
     })
   }, [])
 
-  // Called when notes are detected (MIDI noteOn or mic detection)
-  const checkNotes = useCallback(() => {
+  // ---- Step timing ---------------------------------------------------------
+  // Once every note of a step has been played, the cursor stays on it until the
+  // step's written time is up (the time to the next step, at the current BPM),
+  // counted from the moment it was completed. Letting go early doesn't matter.
+  const scheduleStepWait = useCallback((idx, due) => {
+    const timer = setTimeout(() => {
+      // A stale wait (the cursor was moved by hand, or practice stopped) does nothing.
+      if (stepWaitRef.current?.timer !== timer || currentNoteIndexRef.current !== idx) return
+      stepWaitRef.current = null
+      stepGateRef.current.advance()
+      doAdvance()
+    }, Math.max(0, due - performance.now()))
+    stepWaitRef.current = { timer, idx, due }
+  }, [doAdvance])
+
+  const startStepWait = useCallback((idx, completedAt) => {
+    const tl = noteTimelineRef.current
+    const cur = tl[idx]
+    const next = tl[idx + 1]
+    if (!next) { doAdvance(); return } // last step: done
+    const stepMs = Math.max(0, ((next.timeSec ?? 0) - (cur?.timeSec ?? 0)) * 1000)
+    scheduleStepWait(idx, completedAt + stepMs)
+  }, [doAdvance, scheduleStepWait])
+
+  const resetStepState = () => {
+    if (stepWaitRef.current?.timer) clearTimeout(stepWaitRef.current.timer)
+    stepWaitRef.current = null
+    stepGateRef.current.reset()
+    micHeardRef.current = new Set()
+  }
+
+  // A key press (MIDI note-on, or a note newly heard by the mic).
+  const handlePress = useCallback((name) => {
     if (completedRef.current || pausedRef.current) return
     if (modeRef.current !== 'practice') return
-    if (advanceCooldownRef.current) return
-
+    const tl = noteTimelineRef.current
     const idx = currentNoteIndexRef.current
-    const target = noteTimelineRef.current[idx]
+    const target = tl[idx]
     if (!target) return
-
-    const targetNotes = target.notes
+    const next = tl[idx + 1]
     const anyOct = anyOctaveRef.current
-    const held = [...heldNotesRef.current]
+    const now = performance.now()
 
-    if (held.length === 0) return
+    // The current step is done and waiting out its time: only notes of the next
+    // step matter, and they count as soon as the cursor gets there.
+    if (stepWaitRef.current) {
+      stepGateRef.current.pressDuringWait(name, next?.notes, anyOct, now)
+      return
+    }
 
-    // Check: every target note is held
-    const allTargetsHeld = targetNotes.every((tn) =>
-      held.some((h) => notesMatch(h, tn, anyOct))
-    )
-
-    // Check: no extra notes beyond the target
-    const noExtras = held.every((h) =>
-      targetNotes.some((tn) => notesMatch(h, tn, anyOct))
-    )
-
-    if (allTargetsHeld && noExtras) {
-      // Correct — wait for release before advancing
-      waitingForReleaseRef.current = true
+    const r = stepGateRef.current.press(name, target.notes, next?.notes, anyOct, now)
+    if (r === 'complete') {
       clearTimeout(wrongTimerRef.current)
       wrongTimerRef.current = null
       setShowHint(false)
       wrongCountRef.current = 0
-    } else if (noExtras && !allTargetsHeld) {
-      // User is still building the chord — all held notes are valid targets,
-      // just not all of them pressed yet. Don't penalize, just wait.
-    } else {
-      // Wrong note(s) played — at least one held note is not in the target
-      waitingForReleaseRef.current = false
+      startStepWait(idx, now)
+    } else if (r === 'wrong') {
       wrongCountRef.current++
-
       if (wrongCountRef.current >= MAX_WRONG_ATTEMPTS) {
         // Play the target note as a hint
         setShowHint(true)
@@ -645,25 +637,22 @@ function App() {
         }, HINT_DELAY_MS)
       }
     }
-  }, [playTargetHint])
-
-  // Called when all notes are released
-  const handleRelease = useCallback(() => {
-    if (waitingForReleaseRef.current) {
-      waitingForReleaseRef.current = false
-      doAdvance()
-    }
-  }, [doAdvance])
+  }, [playTargetHint, startStepWait])
 
   const handleNoteOff = useCallback((note) => {
     heldNotesRef.current.delete(note)
-    if (heldNotesRef.current.size === 0) {
-      setDetectedNote(null)
-      handleRelease()
-    } else {
-      setDetectedNote([...heldNotesRef.current].join(' + '))
-    }
-  }, [handleRelease])
+    setDetectedNote(heldNotesRef.current.size ? [...heldNotesRef.current].join(' + ') : null)
+  }, [])
+
+  // The cursor moved on: notes of this step that were played early may already
+  // complete it, in which case its wait starts from when they were played.
+  useEffect(() => {
+    if (mode !== 'practice' || stepWaitRef.current) return
+    const target = noteTimelineRef.current[currentNoteIndex]
+    if (!target) return
+    const r = stepGateRef.current.check(target.notes)
+    if (r.complete) startStepWait(currentNoteIndex, r.at ?? performance.now())
+  }, [currentNoteIndex]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Auto-reconnect MIDI when device changes mid-practice
   useEffect(() => {
@@ -679,7 +668,7 @@ function App() {
         (note) => {
           heldNotesRef.current.add(note)
           setDetectedNote([...heldNotesRef.current].join(' + '))
-          checkNotes()
+          handlePress(note)
         },
         handleNoteOff,
       )
@@ -691,7 +680,7 @@ function App() {
     })()
 
     return () => { cancelled = true }
-  }, [selectedDeviceId, mode, inputMode, checkNotes, handleNoteOff])
+  }, [selectedDeviceId, mode, inputMode, handlePress, handleNoteOff])
 
   // Cleanup on unmount
   useEffect(() => {
@@ -717,6 +706,7 @@ function App() {
     clearTimeout(wrongTimerRef.current)
     wrongTimerRef.current = null
     heldNotesRef.current.clear()
+    resetStepState()
     stopToneListenLoop()
     Tone.getTransport().stop()
     Tone.getTransport().cancel()
@@ -754,76 +744,11 @@ function App() {
     setMusicXml(data)
   }
 
-  // ── Library / folder handlers ────────────────────────────────────────────────
-  async function refreshFolder(path) {
-    if (!path) return
-    setFolderLoading(true)
-    try {
-      const scores = await listScores(path)
-      setFolderScores(scores)
-    } catch (e) {
-      console.error('[Library] listScores failed:', e)
-      setFolderScores([])
-    } finally {
-      setFolderLoading(false)
-    }
-  }
-
-  async function openLibrary() {
-    setShowLibrary(true)
-    if (folderPath) await refreshFolder(folderPath)
-  }
-
+  // ── Folder picker (home screen) ──────────────────────────────────────────────
   async function handlePickFolder() {
     const picked = await pickFolder()
     if (!picked) return
     setFolderPath(picked)
-    await refreshFolder(picked)
-  }
-
-  async function handleChangeFolder() {
-    const picked = await pickFolder()
-    if (!picked) return
-    setFolderPath(picked)
-    await refreshFolder(picked)
-  }
-
-  async function handleLoadFolderScore(score) {
-    setShowLibrary(false)
-    try {
-      const data = await loadScore(score)
-      setFilename(score.name.replace(/\.[^.]+$/, ''))
-      setMusicXml(data)
-    } catch (e) {
-      console.error('[Library] loadScore failed:', e)
-    }
-  }
-
-  async function handleOpenFolderScoreInVisualizer(score) {
-    try {
-      const data = await loadScore(score)
-      openInVisualizer(data, score.name.replace(/\.[^.]+$/, ''))
-    } catch (e) {
-      console.error('[Library] loadScore for visualizer failed:', e)
-    }
-  }
-
-  function openInVisualizer(data, name) {
-    // Pass song to Visualizer via sessionStorage then navigate
-    try {
-      if (data instanceof ArrayBuffer) {
-        // Store as base64 for ArrayBuffer
-        const bytes = new Uint8Array(data)
-        let bin = ''
-        bytes.forEach(b => { bin += String.fromCharCode(b) })
-        sessionStorage.setItem('nf-vis-song', JSON.stringify({ name, type: 'binary', data: btoa(bin) }))
-      } else {
-        sessionStorage.setItem('nf-vis-song', JSON.stringify({ name, type: 'text', data }))
-      }
-    } catch (e) {
-      console.error('openInVisualizer: sessionStorage failed', e)
-    }
-    window.location.hash = '/visualizer'
   }
 
   function handleBack() {
@@ -1041,6 +966,7 @@ function App() {
     setShowHint(false)
     setMode('practice')
     lastTickSetRef.current = -1
+    resetStepState()
 
     if (inputMode === 'midi') {
       if (!selectedDeviceId) {
@@ -1057,7 +983,7 @@ function App() {
         (note) => {
           heldNotesRef.current.add(note)
           setDetectedNote([...heldNotesRef.current].join(' + '))
-          checkNotes()
+          handlePress(note)
         },
         handleNoteOff,
       )
@@ -1070,17 +996,13 @@ function App() {
     } else {
       try {
         const onNotes = (notes) => {
-          if (notes && notes.length > 0) {
-            heldNotesRef.current.clear()
-            for (const n of notes) heldNotesRef.current.add(n)
-            setDetectedNote(notes.join(' + '))
-            checkNotes()
-          } else {
-            // All notes released — trigger release logic
-            heldNotesRef.current.clear()
-            setDetectedNote(null)
-            handleRelease()
-          }
+          const heard = new Set(notes ?? [])
+          heldNotesRef.current = heard
+          setDetectedNote(heard.size ? [...heard].join(' + ') : null)
+          // A note that is still ringing is not played again; one that has just
+          // appeared is a new press.
+          for (const n of heard) if (!micHeardRef.current.has(n)) handlePress(n)
+          micHeardRef.current = heard
         }
         const stop = await startBasicPitchDetection(onNotes)
         stopMicRef.current = stop
@@ -1106,6 +1028,11 @@ function App() {
   }
 
   function handlePausePractice() {
+    const w = stepWaitRef.current
+    if (w?.timer) {
+      clearTimeout(w.timer)
+      stepWaitRef.current = { idx: w.idx, remaining: Math.max(0, w.due - performance.now()) }
+    }
     setPaused(true)
     clearTimeout(wrongTimerRef.current)
     wrongTimerRef.current = null
@@ -1113,10 +1040,13 @@ function App() {
   }
 
   function handleResumePractice() {
+    const w = stepWaitRef.current
+    if (w && !w.timer) scheduleStepWait(w.idx, performance.now() + w.remaining)
     setPaused(false)
   }
 
   function handleRestart() {
+    resetStepState()
     setCompleted(false)
     setCurrentNoteIndex(0)
     setDetectedNote(null)
@@ -1130,11 +1060,13 @@ function App() {
   // Navigation
   function handlePrevMoment() {
     lastTickSetRef.current = -1
+    resetStepState()
     setCurrentNoteIndex((i) => Math.max(0, i - 1))
   }
 
   function handleNextMoment() {
     lastTickSetRef.current = -1
+    resetStepState()
     setCurrentNoteIndex((i) => Math.min(noteTimeline.length - 1, i + 1))
   }
 
@@ -1145,6 +1077,7 @@ function App() {
     const idx = noteTimeline.findIndex((m) => m.measure === target)
     if (idx !== -1) {
       lastTickSetRef.current = -1
+      resetStepState()
       setCurrentNoteIndex(idx)
     }
   }
@@ -1155,6 +1088,7 @@ function App() {
     const idx = noteTimeline.findIndex((m) => m.measure === target)
     if (idx !== -1) {
       lastTickSetRef.current = -1
+      resetStepState()
       setCurrentNoteIndex(idx)
     }
   }
@@ -1182,25 +1116,6 @@ function App() {
   const chevronRight = (
     <svg width="14" height="14" viewBox="0 0 20 20" fill="none">
       <path d="M7.5 5L12.5 10L7.5 15" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-    </svg>
-  )
-
-  const { theme } = useTheme()
-
-  const LogoSvg = ({ size = 40, bg }) => (
-    <svg width={size} height={size} viewBox="0 0 72 72" fill="none" aria-label="Pianly logo">
-      <rect x="8" y="20" width="10" height="36" rx="2" fill="white" />
-      <rect x="20" y="20" width="10" height="36" rx="2" fill="white" />
-      <rect x="32" y="20" width="10" height="36" rx="2" fill="white" />
-      <rect x="44" y="20" width="10" height="36" rx="2" fill="white" />
-      <rect x="56" y="20" width="10" height="36" rx="2" fill="white" />
-      <rect x="15" y="20" width="8" height="22" rx="1.5" fill={bg} />
-      <rect x="27" y="20" width="8" height="22" rx="1.5" fill={bg} />
-      <rect x="47" y="20" width="8" height="22" rx="1.5" fill={bg} />
-      <rect x="59" y="20" width="8" height="22" rx="1.5" fill={bg} />
-      <circle cx="58" cy="14" r="4" fill="oklch(0.7 0.2 160)" />
-      <rect x="62" y="4" width="2.5" height="12" rx="1" fill="oklch(0.7 0.2 160)" />
-      <path d="M64.5 4 C64.5 4 70 6 70 9" stroke="oklch(0.7 0.2 160)" strokeWidth="2.5" strokeLinecap="round" />
     </svg>
   )
 
@@ -1291,129 +1206,6 @@ function App() {
         onChange={handleFileChange}
         className="hidden"
       />
-
-      {/* ── Library Modal ─────────────────────────────────────────────────────── */}
-      {showLibrary && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4"
-          onClick={(e) => { if (e.target === e.currentTarget) setShowLibrary(false) }}>
-          <div className="rounded-2xl w-full max-w-lg max-h-[80vh] flex flex-col p-5 sm:p-6"
-            style={{ background: 'var(--panel)', border: '1px solid var(--border)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
-            <div className="flex items-center justify-between mb-4 shrink-0">
-              <h2 className="text-lg font-bold" style={{color:'var(--ink)'}}>Song Library</h2>
-              <button onClick={() => setShowLibrary(false)} style={{color:'var(--sub)'}} className="transition-colors cursor-pointer" aria-label="Close"
-                onMouseEnter={e=>e.currentTarget.style.color='var(--ink)'} onMouseLeave={e=>e.currentTarget.style.color='var(--sub)'}>
-                <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M15 5L5 15M5 5l10 10" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>
-              </button>
-            </div>
-            <div className="flex gap-1 mb-4 shrink-0 rounded-lg p-1" style={{background:'rgba(0,255,200,0.04)'}}>
-              {[['mysongs', 'My Scores'], ['demos', 'Demo Pieces']].map(([tab, label]) => (
-                <button key={tab} onClick={() => setLibraryTab(tab)}
-                  className="flex-1 py-1.5 rounded-md text-xs font-semibold transition-colors cursor-pointer"
-                  style={libraryTab === tab ? {background:'var(--accent)',color:'#000'} : {color:'var(--sub)'}}>
-                  {label}
-                </button>
-              ))}
-            </div>
-            <div className="flex-1 overflow-y-auto min-h-0">
-              {libraryTab === 'mysongs' && (
-                <div className="flex flex-col gap-2">
-                  {!folderPath ? (
-                    /* No folder selected yet */
-                    <div className="flex flex-col items-center gap-3 py-10 text-center">
-                      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" style={{color:'var(--sub)'}}><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
-                      <p className="text-sm" style={{color:'var(--sub)'}}>No scores folder set.<br/>Pick a folder containing your MusicXML files.</p>
-                      <button onClick={handlePickFolder}
-                        className="px-5 py-2.5 rounded-xl text-sm font-bold cursor-pointer"
-                        style={{background:'var(--accent)',color:'#000'}}>
-                        Choose Scores Folder
-                      </button>
-                    </div>
-                  ) : (
-                    <>
-                      {/* Folder header */}
-                      <div className="flex items-center justify-between mb-1 gap-2">
-                        <p className="text-xs truncate flex-1" style={{color:'var(--sub)'}} title={folderPath}>{folderPath}</p>
-                        <div className="flex gap-1 shrink-0">
-                          <button onClick={() => refreshFolder(folderPath)} title="Refresh"
-                            className="w-7 h-7 flex items-center justify-center rounded-lg transition-colors cursor-pointer"
-                            style={{color:'var(--sub)'}}
-                            onMouseEnter={e=>{e.currentTarget.style.color='var(--ink)';e.currentTarget.style.background='rgba(255,255,255,0.08)'}}
-                            onMouseLeave={e=>{e.currentTarget.style.color='var(--sub)';e.currentTarget.style.background='transparent'}}>
-                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 102.13-9.36L1 10"/></svg>
-                          </button>
-                          <button onClick={handleChangeFolder} title="Change Folder"
-                            className="px-2.5 py-1 rounded-lg text-xs transition-colors cursor-pointer"
-                            style={{border:'1px solid var(--border)',color:'var(--sub)'}}
-                            onMouseEnter={e=>e.currentTarget.style.color='var(--ink)'}
-                            onMouseLeave={e=>e.currentTarget.style.color='var(--sub)'}>
-                            Change
-                          </button>
-                        </div>
-                      </div>
-                      {/* Score list */}
-                      {folderLoading ? (
-                        <p className="text-sm text-center py-8" style={{color:'var(--sub)'}}>Scanning folder…</p>
-                      ) : folderScores.length === 0 ? (
-                        <p className="text-sm text-center py-8" style={{color:'var(--sub)'}}>No valid score files found (.xml, .musicxml, .mxl, .mid).</p>
-                      ) : folderScores.map(score => (
-                        <div key={score.path} className="flex items-center justify-between p-3 rounded-xl transition-colors"
-                          style={{border:'1px solid var(--border)'}}>
-                          <div className="min-w-0 mr-3">
-                            <div className="font-medium text-sm truncate" style={{color:'var(--ink)'}}>{score.name.replace(/\.[^.]+$/, '')}</div>
-                            <div className="text-xs mt-0.5" style={{color:'var(--sub)'}}>{score.name.split('.').pop().toUpperCase()}</div>
-                          </div>
-                          <div className="flex items-center gap-2 shrink-0">
-                            <button onClick={() => handleOpenFolderScoreInVisualizer(score)}
-                              title="Open in Visualizer"
-                              className="px-2.5 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer"
-                              style={{border:'1.5px solid var(--accent)',color:'var(--accent)'}}>
-                              Visualizer
-                            </button>
-                            <button onClick={() => handleLoadFolderScore(score)}
-                              className="px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer"
-                              style={{background:'var(--accent)',color:'#000'}}>
-                              Load
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </>
-                  )}
-                </div>
-              )}
-              {libraryTab === 'demos' && (
-                <div className="flex flex-col gap-2">
-                  {DEMO_PIECES.map(piece => (
-                    <div key={piece.id} className="flex items-center justify-between p-3 rounded-xl transition-colors"
-                      style={{border:'1px solid var(--border)'}}>
-                      <div className="min-w-0 mr-3">
-                        <div className="font-semibold text-sm truncate" style={{color:'var(--ink)'}}>{piece.title}</div>
-                        <div className="text-xs mt-0.5" style={{color:'var(--sub)'}}>{piece.composer}</div>
-                      </div>
-                      <div className="flex items-center gap-2 shrink-0">
-                        <span className="text-xs font-medium px-2 py-0.5 rounded-full" style={{background:'rgba(0,255,200,0.1)',color:'var(--ink)',border:'1px solid var(--border)'}}>
-                          {piece.difficulty}
-                        </span>
-                        <button onClick={async () => { const data = await loadDemoScore(piece); openInVisualizer(data, piece.title) }}
-                          title="Open in Visualizer"
-                          className="px-2.5 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer"
-                          style={{border:'1.5px solid var(--accent)',color:'var(--accent)'}}>
-                          Visualizer
-                        </button>
-                        <button onClick={() => { setShowLibrary(false); handleSelectDemo(piece) }}
-                          className="px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer"
-                          style={{background:'var(--accent)',color:'#000'}}>
-                          Load
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* ── Home Settings Modal ────────────────────────────────────────────── */}
       {showHomeSettings && (

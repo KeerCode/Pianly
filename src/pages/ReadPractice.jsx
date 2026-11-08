@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import createVerovioModule from 'verovio/wasm'
 import { VerovioToolkit } from 'verovio/esm'
-import { enableMidi, listenToDevice, onDevicesChanged } from '../input/midiInput'
+import { enableMidi, listenToDevice } from '../input/midiInput'
 import { startBasicPitchDetection, loadBasicPitchModel } from '../input/pitchDetector'
 import { noteNameToMidi } from '../utils/noteConversion'
 import Background from '../Background'
@@ -211,7 +211,6 @@ export default function ReadPractice() {
   const [mode, setMode]               = useState('vibe')    // 'vibe' | 'practice'
   const [difficulty, setDifficulty]   = useState(1)
   const [inputMethod, setInputMethod] = useState('midi')
-  const [midiDevices, setMidiDevices] = useState([])
   const [selectedDevice, setSelectedDevice] = useState(null)
   const [showNoteNames, setShowNoteNames]   = useState(true)
 
@@ -328,13 +327,10 @@ export default function ReadPractice() {
     if (screen !== 'playing' || inputMethod !== 'midi') return
     enableMidi().then(({ inputs }) => {
       const mapped = (inputs || []).map(inp => ({ id: inp.id, name: inp.name }))
-      setMidiDevices(mapped)
       if (mapped.length > 0 && selectedDevice == null) {
         setSelectedDevice(mapped[0].id)
       }
     })
-    const stopWatch = onDevicesChanged(inputs => setMidiDevices(inputs))
-    return () => stopWatch?.()
   }, [screen, inputMethod])   // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── MIDI device connection ──
@@ -378,7 +374,7 @@ export default function ReadPractice() {
         updateHeldDisplayRef.current?.()
         return
       }
-      const midis = noteNames.map(pitchNameToMidi).filter(m => m !== null)
+      const midis = noteNames.map(noteNameToMidi).filter(m => m !== null)
       heldNotesRef.current.clear()
       midis.forEach(m => heldNotesRef.current.add(m))
       updateHeldDisplayRef.current?.()
@@ -386,6 +382,8 @@ export default function ReadPractice() {
     }).then(stop => {
       stopFn = stop
       stopMicRef.current = stop
+    }).catch((err) => {
+      console.error('[ReadPractice] Mic start failed:', err)
     })
 
     return () => {

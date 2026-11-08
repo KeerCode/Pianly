@@ -28,6 +28,7 @@ export function tickToSec(tick, tempoMap) {
  * Parse note timeline directly from MusicXML string.
  * Returns { timeline, divisions, tempo, tempoMap } where timeline entries have:
  *   { tick, duration, durationSec, measure, notes: string[], isTied }
+ * Tied notes are one entry whose duration spans the whole tie chain.
  * Ticks/durations are scaled to 960-per-quarter for AlphaTab compatibility.
  * Parses all <part> elements — first part = right hand, second = left hand.
  * tempoMap is [{ tick, bpm }] tracking all mid-piece tempo changes.
@@ -104,6 +105,16 @@ export function parseNoteTimeline(xmlString, defaultBpm = 120) {
   if (parts.length === 0) return { timeline: [], divisions: 1, tempo: initialTempo, tempoMap }
 
   const allNotes = []
+  // A tied note is ONE note that lasts the whole chain. `openTies` maps
+  // "hand:pitch" to the entry a tie is currently extending, so a tie-stop (or a
+  // stop-and-start in the middle of a chain) lengthens that entry instead of
+  // becoming a new note the player would have to press again.
+  const openTies = new Map()
+  const extendEntry = (entry, extraTicks) => {
+    entry.duration = Math.round(entry.duration + extraTicks)
+    const endTick = entry.tick + entry.duration
+    entry.durationSec = tickToSec(endTick, tempoMap) - tickToSec(entry.tick, tempoMap)
+  }
 
   parts.forEach((part, partIndex) => {
     const hand = partIndex === 0 ? 'right' : 'left'
@@ -162,9 +173,19 @@ export function parseNoteTimeline(xmlString, defaultBpm = 120) {
             if (t.getAttribute('type') === 'start') hasTieStart = true
           })
 
-          if (hasTieStop && !hasTieStart) {
-            if (!isChord) measureTick += durationTicks
-            continue
+          const tieKey = `${hand}:${noteName}`
+          if (hasTieStop) {
+            const open = openTies.get(tieKey)
+            if (open) {
+              // Continuation of a tie: lengthen the note it started, add no new note.
+              extendEntry(open, durationTicks)
+              if (!hasTieStart) openTies.delete(tieKey)
+              if (!isChord) measureTick += durationTicks
+              continue
+            }
+            // A tie-stop with no matching start (malformed score, tie across a
+            // repeat): fall through and treat it as an ordinary note, so it is
+            // asked for rather than silently dropped.
           }
 
           if (isChord) {
@@ -177,14 +198,14 @@ export function parseNoteTimeline(xmlString, defaultBpm = 120) {
                 if (!allNotes[j].notes.includes(noteName)) {
                   allNotes[j].notes.push(noteName)
                 }
-                if (hasTieStart) allNotes[j].isTied = true
+                if (hasTieStart) { allNotes[j].isTied = true; openTies.set(tieKey, allNotes[j]) }
                 break
               }
             }
           } else {
             const noteTick = Math.round(measureTick)
             const noteEndTick = Math.round(measureTick + durationTicks)
-            allNotes.push({
+            const entry = {
               tick: noteTick,
               duration: Math.round(durationTicks),
               durationSec: tickToSec(noteEndTick, tempoMap) - tickToSec(noteTick, tempoMap),
@@ -192,7 +213,9 @@ export function parseNoteTimeline(xmlString, defaultBpm = 120) {
               notes: [noteName],
               isTied: hasTieStart,
               hand,
-            })
+            }
+            allNotes.push(entry)
+            if (hasTieStart) openTies.set(tieKey, entry)
             measureTick += durationTicks
           }
         } else if (!isChord) {

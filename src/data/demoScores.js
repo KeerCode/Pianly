@@ -17,10 +17,6 @@ const META = {
   },
 }
 
-function slugFromPath(path) {
-  return path.split('/').pop().replace(/\.[^.]+$/, '')
-}
-
 function titleFromSlug(slug) {
   // "Fur_Elise_fingered" → "Fur Elise fingered"
   return slug.replace(/_/g, ' ')
