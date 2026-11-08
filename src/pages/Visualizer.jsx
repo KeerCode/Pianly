@@ -1016,19 +1016,19 @@ export default function Visualizer() {
                 />
               </div>
               <div>
-                <label className="text-[10px] uppercase tracking-wider font-medium mb-1.5 block" style={{color:'var(--sub)'}}>Right Hand</label>
+                <label className="text-[10px] uppercase tracking-wider font-medium mb-1.5 block" style={{color:'var(--sub)'}}>Left Hand</label>
                 {isMobile
-                  ? <ColorSwatches value={rightColor} onChange={setRightColor} />
-                  : <input type="color" value={rightColor} onChange={(e) => setRightColor(e.target.value)}
+                  ? <ColorSwatches value={leftColor} onChange={setLeftColor} />
+                  : <input type="color" value={leftColor} onChange={(e) => setLeftColor(e.target.value)}
                       className="w-full h-8 rounded bg-transparent cursor-pointer" style={{border:'1px solid var(--border)'}}
                     />
                 }
               </div>
               <div>
-                <label className="text-[10px] uppercase tracking-wider font-medium mb-1.5 block" style={{color:'var(--sub)'}}>Left Hand</label>
+                <label className="text-[10px] uppercase tracking-wider font-medium mb-1.5 block" style={{color:'var(--sub)'}}>Right Hand</label>
                 {isMobile
-                  ? <ColorSwatches value={leftColor} onChange={setLeftColor} />
-                  : <input type="color" value={leftColor} onChange={(e) => setLeftColor(e.target.value)}
+                  ? <ColorSwatches value={rightColor} onChange={setRightColor} />
+                  : <input type="color" value={rightColor} onChange={(e) => setRightColor(e.target.value)}
                       className="w-full h-8 rounded bg-transparent cursor-pointer" style={{border:'1px solid var(--border)'}}
                     />
                 }
