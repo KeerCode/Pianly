@@ -1,11 +1,21 @@
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use midir::{MidiInput, MidiInputConnection};
 use serde::Serialize;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::sync::Mutex;
-use tauri::{Emitter, State};
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use tauri::Emitter;
+use tauri::State;
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[derive(Default)]
 struct MidiState {
     connection: Mutex<Option<MidiInputConnection<()>>>,
 }
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+#[derive(Default)]
+struct MidiState;
 
 #[derive(Serialize, Clone)]
 struct MidiDevice {
@@ -13,21 +23,30 @@ struct MidiDevice {
     name: String,
 }
 
-#[derive(Serialize, Clone)]
-struct MidiNoteEvent {
-    note: String,
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod midi_impl {
+    use super::*;
+
+    #[derive(Serialize, Clone)]
+    pub(super) struct MidiNoteEvent {
+        pub(super) note: String,
+    }
+
+    const NOTE_NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+
+    pub(super) fn midi_number_to_note(num: u8) -> String {
+        let name = NOTE_NAMES[(num % 12) as usize];
+        let octave = (num as i32 / 12) - 2;
+        format!("{}{}", name, octave)
+    }
 }
 
-const NOTE_NAMES: [&str; 12] = [
-    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-];
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use midi_impl::*;
 
-fn midi_number_to_note(num: u8) -> String {
-    let name = NOTE_NAMES[(num % 12) as usize];
-    let octave = (num as i32 / 12) - 2;
-    format!("{}{}", name, octave)
-}
-
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[tauri::command]
 fn get_midi_inputs() -> Vec<MidiDevice> {
     let midi_in = match MidiInput::new("pianly-list") {
@@ -51,6 +70,13 @@ fn get_midi_inputs() -> Vec<MidiDevice> {
         .collect()
 }
 
+#[cfg(any(target_os = "android", target_os = "ios"))]
+#[tauri::command]
+fn get_midi_inputs() -> Vec<MidiDevice> {
+    vec![]
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[tauri::command]
 fn connect_midi(
     device_id: usize,
@@ -107,6 +133,17 @@ fn connect_midi(
     Ok(port_name)
 }
 
+#[cfg(any(target_os = "android", target_os = "ios"))]
+#[tauri::command]
+fn connect_midi(
+    _device_id: usize,
+    _app: tauri::AppHandle,
+    _state: State<'_, MidiState>,
+) -> Result<String, String> {
+    Err("MIDI input is not supported on this platform".into())
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[tauri::command]
 fn disconnect_midi(state: State<'_, MidiState>) {
     let mut conn = state.connection.lock().unwrap();
@@ -116,14 +153,16 @@ fn disconnect_midi(state: State<'_, MidiState>) {
     }
 }
 
+#[cfg(any(target_os = "android", target_os = "ios"))]
+#[tauri::command]
+fn disconnect_midi(_state: State<'_, MidiState>) {}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(MidiState {
-            connection: Mutex::new(None),
-        })
+        .manage(MidiState::default())
         .invoke_handler(tauri::generate_handler![
             get_midi_inputs,
             connect_midi,

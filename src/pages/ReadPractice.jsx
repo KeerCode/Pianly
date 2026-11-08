@@ -4,6 +4,7 @@ import { VerovioToolkit } from 'verovio/esm'
 import { enableMidi, listenToDevice } from '../input/midiInput'
 import { startBasicPitchDetection, loadBasicPitchModel } from '../input/pitchDetector'
 import { noteNameToMidi } from '../utils/noteConversion'
+import { isMobile } from '../lib/platform'
 import Background from '../Background'
 import { useTheme } from '../ThemeContext'
 
@@ -210,7 +211,7 @@ export default function ReadPractice() {
   const [screen, setScreen]           = useState('start')   // 'start' | 'playing' | 'summary'
   const [mode, setMode]               = useState('vibe')    // 'vibe' | 'practice'
   const [difficulty, setDifficulty]   = useState(1)
-  const [inputMethod, setInputMethod] = useState('midi')
+  const [inputMethod, setInputMethod] = useState(isMobile ? 'mic' : 'midi')
   const [selectedDevice, setSelectedDevice] = useState(null)
   const [showNoteNames, setShowNoteNames]   = useState(true)
 
@@ -363,35 +364,58 @@ export default function ReadPractice() {
   }, [screen, inputMethod, selectedDevice])
 
   // ── Mic connection ──
+  const micStartingRef = useRef(false)
+  const startMic = useCallback(async () => {
+    if (micStartingRef.current) return
+    micStartingRef.current = true
+    loadBasicPitchModel()
+    try {
+      const stop = await startBasicPitchDetection((noteNames) => {
+        if (!noteNames) {
+          heldNotesRef.current.clear()
+          updateHeldDisplayRef.current?.()
+          return
+        }
+        const midis = noteNames.map(noteNameToMidi).filter(m => m !== null)
+        heldNotesRef.current.clear()
+        midis.forEach(m => heldNotesRef.current.add(m))
+        updateHeldDisplayRef.current?.()
+        checkMatchRef.current?.()
+      })
+      stopMicRef.current = stop
+    } catch (err) {
+      console.error('[ReadPractice] Mic start failed:', err)
+    } finally {
+      micStartingRef.current = false
+    }
+  }, [])
+
   useEffect(() => {
     if (screen !== 'playing' || inputMethod !== 'mic') return
-    let stopFn = null
-    loadBasicPitchModel()
-
-    startBasicPitchDetection((noteNames) => {
-      if (!noteNames) {
-        heldNotesRef.current.clear()
-        updateHeldDisplayRef.current?.()
-        return
-      }
-      const midis = noteNames.map(noteNameToMidi).filter(m => m !== null)
-      heldNotesRef.current.clear()
-      midis.forEach(m => heldNotesRef.current.add(m))
-      updateHeldDisplayRef.current?.()
-      checkMatchRef.current?.()
-    }).then(stop => {
-      stopFn = stop
-      stopMicRef.current = stop
-    }).catch((err) => {
-      console.error('[ReadPractice] Mic start failed:', err)
+    let cancelled = false
+    startMic().then(() => {
+      if (cancelled) { stopMicRef.current?.(); stopMicRef.current = null }
     })
-
     return () => {
-      stopFn?.()
+      cancelled = true
+      stopMicRef.current?.()
       stopMicRef.current = null
       heldNotesRef.current.clear()
     }
-  }, [screen, inputMethod])
+  }, [screen, inputMethod, startMic])
+
+  // Release the mic when backgrounded; reopen it on return to the foreground.
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        if (stopMicRef.current) { stopMicRef.current(); stopMicRef.current = null }
+      } else if (screen === 'playing' && inputMethod === 'mic' && !stopMicRef.current) {
+        startMic()
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => document.removeEventListener('visibilitychange', onVisibility)
+  }, [screen, inputMethod, startMic])
 
   // ── Start game ──
   const startGame = useCallback(() => {
@@ -442,7 +466,7 @@ export default function ReadPractice() {
     return (
       <div className="min-h-screen text-white relative overflow-hidden" style={{ backgroundColor: theme.bg }}>
         <Background />
-        <div className="relative z-10 flex flex-col items-center justify-center min-h-screen p-6">
+        <div className="relative z-10 flex flex-col items-center justify-center min-h-screen p-6 [@media(max-height:500px)]:py-1 [@media(max-height:500px)]:px-3 [@media(max-height:500px)]:justify-start">
 
           {/* Back */}
           <button
@@ -457,20 +481,20 @@ export default function ReadPractice() {
           </button>
 
           {/* Header */}
-          <div className="text-center mb-10">
-            <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl mb-5"
+          <div className="text-center mb-10 [@media(max-height:500px)]:mb-2">
+            <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl mb-5 [@media(max-height:500px)]:hidden"
               style={{ border: '1px solid var(--border)', background: 'rgba(0,255,200,0.05)' }}>
               <svg width="24" height="24" viewBox="0 0 24 24" fill="none" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"
                 style={{ stroke: 'var(--accent)' }}>
                 <path d="M9 19V6l12-3v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
               </svg>
             </div>
-            <h1 className="text-4xl font-bold tracking-tight mb-1" style={{ color: 'var(--ink)' }}>Read Practice</h1>
+            <h1 className="text-4xl [@media(max-height:500px)]:text-2xl font-bold tracking-tight mb-1" style={{ color: 'var(--ink)' }}>Read Practice</h1>
             <p className="text-sm" style={{ color: 'var(--sub)' }}>Sight-reading reaction training</p>
           </div>
 
           {/* Mode toggle */}
-          <div className="flex gap-1 mb-8 p-1 rounded-xl" style={{ border: '1px solid var(--border)', background: 'rgba(255,255,255,0.03)' }}>
+          <div className="flex gap-1 mb-8 [@media(max-height:500px)]:mb-1 p-1 rounded-xl" style={{ border: '1px solid var(--border)', background: 'rgba(255,255,255,0.03)' }}>
             {[
               { id: 'vibe',     label: 'Vibe',     sub: 'Endless flow'        },
               { id: 'practice', label: 'Practice', sub: 'Track reaction time' },
@@ -478,7 +502,7 @@ export default function ReadPractice() {
               <button
                 key={m.id}
                 onClick={() => setMode(m.id)}
-                className="px-6 py-2.5 rounded-lg text-sm font-semibold transition-all cursor-pointer"
+                className="px-6 py-2.5 [@media(max-height:500px)]:py-1 rounded-lg text-sm font-semibold transition-all cursor-pointer"
                 style={mode === m.id
                   ? { background: 'var(--accent)', color: '#000' }
                   : { color: 'var(--sub)' }}
@@ -490,14 +514,14 @@ export default function ReadPractice() {
           </div>
 
           {/* Difficulty grid */}
-          <div className="w-full max-w-xl mb-8">
+          <div className="w-full max-w-xl mb-8 [@media(max-height:500px)]:mb-1">
             <p className="text-[10px] uppercase tracking-widest mb-3 text-center" style={{ color: 'var(--sub)', opacity: 0.6 }}>Difficulty</p>
             <div className="grid grid-cols-4 gap-2">
               {DIFFICULTIES.map(d => (
                 <button
                   key={d.id}
                   onClick={() => setDifficulty(d.id)}
-                  className="p-3 rounded-xl border text-left transition-all cursor-pointer"
+                  className="p-3 [@media(max-height:500px)]:p-1.5 rounded-xl border text-left transition-all cursor-pointer"
                   style={difficulty === d.id
                     ? { borderColor: 'var(--accent)', background: 'rgba(0,255,200,0.1)', color: 'var(--ink)' }
                     : { borderColor: 'var(--border)', background: 'rgba(255,255,255,0.02)', color: 'var(--sub)' }}
@@ -510,11 +534,11 @@ export default function ReadPractice() {
           </div>
 
           {/* Input + note names row */}
-          <div className="flex flex-wrap items-center justify-center gap-3 mb-10">
+          <div className="flex flex-wrap items-center justify-center gap-3 mb-10 [@media(max-height:500px)]:mb-2">
             {[
               { id: 'midi', label: 'MIDI Keyboard' },
               { id: 'mic',  label: 'Microphone'    },
-            ].map(m => (
+            ].filter(m => !isMobile || m.id !== 'midi').map(m => (
               <button
                 key={m.id}
                 onClick={() => setInputMethod(m.id)}
@@ -545,7 +569,7 @@ export default function ReadPractice() {
 
           <button
             onClick={startGame}
-            className="px-14 py-3.5 rounded-xl text-base font-bold transition-all cursor-pointer"
+            className="px-14 py-3.5 [@media(max-height:500px)]:py-1.5 rounded-xl text-base font-bold transition-all cursor-pointer"
             style={{ background: 'var(--accent)', color: '#000' }}
           >
             Start

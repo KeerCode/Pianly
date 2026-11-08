@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import Background from '../Background'
-import { getSavedFolder, pickFolder, listScores, loadScore } from '../lib/scoreFolder'
+import { getSavedFolder, pickFolder, listScores, loadScore, importScores, deleteScore } from '../lib/scoreFolder'
+import { isMobile } from '../lib/platform'
 
 const BORD  = 'rgba(0,255,200,0.12)'
 const BORD2 = 'rgba(0,255,200,0.22)'
@@ -67,6 +68,8 @@ export default function FolderLibrary() {
   const [renames,       setRenames]       = useState(loadRenames)
   const [renamingPath,  setRenamingPath]  = useState(null)
   const [renameValue,   setRenameValue]   = useState('')
+  const [notice,        setNotice]        = useState(null)
+  const importInputRef = useRef(null)
 
   const loadFolder = useCallback(async (path) => {
     if (!path) return
@@ -111,10 +114,43 @@ export default function FolderLibrary() {
   }
 
   async function handlePickFolder() {
+    if (isMobile) {
+      importInputRef.current?.click()
+      return
+    }
     const picked = await pickFolder()
     if (!picked) return
     setFolderPath(picked)
     setSearch('')
+  }
+
+  async function handleImportFiles(e) {
+    // Copy first: clearing the input empties its live FileList in Chromium.
+    const files = Array.from(e.target.files ?? [])
+    e.target.value = ''
+    if (!files.length) return
+    setError(null)
+    setNotice(null)
+    try {
+      const { imported, skipped } = await importScores(files)
+      if (imported > 0) setNotice(`Imported ${imported} file${imported === 1 ? '' : 's'}`)
+      if (skipped > 0) setError(`Skipped ${skipped} unsupported file${skipped === 1 ? '' : 's'}.`)
+      if (imported === 0 && skipped === 0) setNotice('Nothing to import.')
+      await loadFolder(folderPath)
+    } catch (err) {
+      setError(`Import failed: ${err?.message ?? err}`)
+    }
+  }
+
+  async function handleDeleteScore(score, displayName) {
+    if (!window.confirm(`Delete "${displayName}" from My Scores?`)) return
+    setError(null)
+    try {
+      await deleteScore(score)
+      await loadFolder(folderPath)
+    } catch (err) {
+      setError(`Delete failed: ${err?.message ?? err}`)
+    }
   }
 
   async function openInVisualizer(score) {
@@ -164,7 +200,7 @@ export default function FolderLibrary() {
            s.name.toLowerCase().includes(search.toLowerCase())
   })
 
-  const folderName = folderPath ? folderPath.split('/').filter(Boolean).pop() : null
+  const folderName = isMobile ? 'My Scores' : (folderPath ? folderPath.split('/').filter(Boolean).pop() : null)
 
   return (
     <div style={{ minHeight: '100vh', color: 'var(--ink)', fontFamily: "'Sora', sans-serif",
@@ -225,13 +261,13 @@ export default function FolderLibrary() {
           </div>
           <span style={{ flex:1, fontSize:13, color: folderPath ? 'var(--ink)' : 'var(--sub)',
             overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
-            {folderPath ?? 'No folder selected'}
+            {isMobile ? 'My Scores' : (folderPath ?? 'No folder selected')}
           </span>
           <button onClick={handlePickFolder}
             style={{ flexShrink:0, padding:'7px 16px', fontSize:12, fontWeight:700, cursor:'pointer',
               background:'var(--accent)', color:'#000', border:'none', borderRadius:8,
               fontFamily:"'Sora', sans-serif" }}>
-            {folderPath ? 'Change' : 'Choose Folder'}
+            {isMobile ? 'Import scores' : (folderPath ? 'Change' : 'Choose Folder')}
           </button>
           {folderPath && (
             <button onClick={() => loadFolder(folderPath)}
@@ -256,6 +292,15 @@ export default function FolderLibrary() {
             background:'rgba(255,80,80,0.08)', border:'1px solid rgba(255,80,80,0.25)',
             color:'#ff6b6b', fontSize:13 }}>
             {error}
+          </div>
+        )}
+
+        {/* Notice (e.g. import result) */}
+        {notice && (
+          <div style={{ marginBottom:24, padding:'12px 16px', borderRadius:10,
+            background:'rgba(0,255,200,0.06)', border:`1px solid ${BORD}`,
+            color:'var(--accent)', fontSize:13 }}>
+            {notice}
           </div>
         )}
 
@@ -425,6 +470,19 @@ export default function FolderLibrary() {
                             borderRadius:8, fontFamily:"'Sora', sans-serif", opacity: openingId ? 0.5 : 1 }}>
                           {isOpening ? '…' : 'Sheet'}
                         </button>
+                        {isMobile && (
+                          <button onClick={() => handleDeleteScore(score, displayName)}
+                            title="Delete"
+                            style={{ flexShrink:0, width:30, height:30, display:'flex', alignItems:'center',
+                              justifyContent:'center', background:'none', border:`1px solid ${BORD}`,
+                              borderRadius:8, cursor:'pointer', color:'var(--sub)' }}>
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                              strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M3 6h18"/><path d="M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2"/>
+                              <path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
+                            </svg>
+                          </button>
+                        )}
                       </div>
                     )}
                   </div>
@@ -444,19 +502,32 @@ export default function FolderLibrary() {
                 {folderName ? `"${folderName}" is empty` : 'No music files found'}
               </p>
               <p style={{ fontSize:14, color:'var(--sub)', margin:0 }}>
-                No .xml, .musicxml, .mxl, or .mid files were found in this folder.
+                {isMobile
+                  ? 'No .xml, .musicxml, .mxl, or .mid files imported yet.'
+                  : 'No .xml, .musicxml, .mxl, or .mid files were found in this folder.'}
               </p>
             </div>
             <button onClick={handlePickFolder}
               style={{ padding:'11px 24px', fontSize:13, fontWeight:700, cursor:'pointer',
                 background:'none', color:'var(--accent)', border:`1.5px solid var(--accent)`,
                 borderRadius:10, fontFamily:"'Sora', sans-serif" }}>
-              Choose a Different Folder
+              {isMobile ? 'Import Scores' : 'Choose a Different Folder'}
             </button>
           </div>
         )}
 
       </div>
+
+      {/* Hidden file input for mobile score import */}
+      {isMobile && (
+        <input
+          ref={importInputRef}
+          type="file"
+          multiple
+          style={{ display: 'none' }}
+          onChange={handleImportFiles}
+        />
+      )}
     </div>
   )
 }

@@ -1,0 +1,22 @@
+{
+  "identifier": "mobile",
+  "description": "enables the app-private scores library on mobile",
+  "platforms": [
+    "android",
+    "iOS"
+  ],
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "fs:allow-read-dir",
+    "fs:allow-read-file",
+    "fs:allow-write-file",
+    "fs:allow-mkdir",
+    "fs:allow-remove",
+    {
+      "identifier": "fs:scope",
+      "allow": ["$APPDATA/scores", "$APPDATA/scores/**"]
+    }
+  ]
+}
