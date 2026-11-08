@@ -20,6 +20,9 @@ jobs:
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
             label: Windows-x64
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            label: Linux-x64
 
     runs-on: ${{ matrix.platform }}
     permissions:
@@ -44,6 +47,13 @@ jobs:
         run: |
           rustup target add ${{ matrix.target }}
 
+      # WebKitGTK etc. for Tauri v2, plus ALSA headers for the midir MIDI crate.
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libxdo-dev libasound2-dev build-essential file
+
       - name: Install frontend dependencies
         run: npm ci
 
@@ -59,6 +69,7 @@ jobs:
 
             **macOS:** Download the `.dmg` file, open it, and drag Pianly to Applications.
             **Windows:** Download the `.msi` installer and run it.
+            **Linux:** Download the `.AppImage` (make it executable: `chmod +x`) or install the `.deb`.
 
             > Note: On macOS, you may need to right-click and select "Open" the first time since the app is not notarized.
           releaseDraft: true
