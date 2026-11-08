@@ -70,8 +70,70 @@ jobs:
             **macOS:** Download the `.dmg` file, open it, and drag Pianly to Applications.
             **Windows:** Download the `.msi` installer and run it.
             **Linux:** Download the `.AppImage` (make it executable: `chmod +x`) or install the `.deb`.
+            **Android:** Download the `.apk` on your phone and open it (allow installing from your browser if asked).
 
             > Note: On macOS, you may need to right-click and select "Open" the first time since the app is not notarized.
           releaseDraft: true
           prerelease: false
           args: --target ${{ matrix.target }}
+
+  # Signed APK, uploaded to the draft release the desktop jobs created.
+  android:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Gradle wrapper jar is a committed binary: check it is an official one.
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Set up signing key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/pianly.jks"
+          {
+            echo "storeFile=$RUNNER_TEMP/pianly.jks"
+            echo "storePassword=$ANDROID_KEYSTORE_PASSWORD"
+            echo "keyAlias=$ANDROID_KEY_ALIAS"
+            echo "keyPassword=$ANDROID_KEYSTORE_PASSWORD"
+          } > src-tauri/gen/android/keystore.properties
+
+      - name: Build APK
+        env:
+          NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: npm run tauri -- android build --apk --target aarch64 --target armv7
+
+      - name: Upload APK to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          apk=$(find src-tauri/gen/android/app/build/outputs/apk -name '*-release.apk' | head -1)
+          cp "$apk" "Pianly_${GITHUB_REF_NAME#v}_android.apk"
+          gh release upload "$GITHUB_REF_NAME" "Pianly_${GITHUB_REF_NAME#v}_android.apk" --clobber
