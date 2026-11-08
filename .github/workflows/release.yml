@@ -125,10 +125,13 @@ jobs:
             echo "keyPassword=$ANDROID_KEYSTORE_PASSWORD"
           } > src-tauri/gen/android/keystore.properties
 
+      # ANDROID_NDK_LATEST_HOME is a runner variable, only visible to the shell
+      # (not to the workflow's env context), so NDK_HOME is set here.
       - name: Build APK
-        env:
-          NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
-        run: npm run tauri -- android build --apk --target aarch64 --target armv7
+        run: |
+          export NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          echo "NDK: $NDK_HOME"
+          npm run tauri -- android build --apk --target aarch64 --target armv7
 
       - name: Upload APK to release
         env:
