@@ -6,10 +6,37 @@ import { parseMidiFile } from '../parsers/parseMidi'
 import { DEMO_PIECES, loadDemoScore } from '../data/demoScores'
 import { SplendidGrandPiano } from 'smplr'
 import { enableMidi } from '../input/midiInput'
+import { isMobile } from '../lib/platform'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import Background from '../Background'
 import { midiToNoteName, noteNameToMidi } from '../utils/noteConversion'
+
+// Preset swatches used on mobile, where the native colour dialog would pull
+// the system bars in and reflow the page.
+const SWATCH_COLORS = ['#3b82f6', '#22c55e', '#ef4444', '#f97316', '#eab308', '#a855f7', '#ec4899', '#06b6d4']
+
+function ColorSwatches({ value, onChange }) {
+  const current = (value || '').toLowerCase()
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {SWATCH_COLORS.map(c => (
+        <button
+          key={c}
+          type="button"
+          aria-label={c}
+          onClick={() => onChange(c)}
+          className="w-[30px] h-[30px] rounded-full cursor-pointer"
+          style={{
+            background: c,
+            outline: current === c ? '2px solid var(--ink)' : 'none',
+            outlineOffset: current === c ? '2px' : '0',
+          }}
+        />
+      ))}
+    </div>
+  )
+}
 
 // ---------------------------------------------------------------------------
 // Piano keyboard layout
@@ -270,7 +297,9 @@ export default function Visualizer() {
   }, [])
 
   // ── Always-on MIDI listening — direct Tauri, no shared singleton ──────────
+  // Skipped on mobile: no MIDI backend, Watch mode only.
   useEffect(() => {
+    if (isMobile) return
     let cancelled = false
     let unlistenOn = null
     let unlistenOff = null
@@ -799,10 +828,17 @@ export default function Visualizer() {
   function handleFileChange(e) {
     const file = e.target.files?.[0]
     if (!file) return
+    const lower = file.name.toLowerCase()
+    // The mobile file input has no accept filter, so validate by extension.
+    if (isMobile && !['.xml', '.musicxml', '.mxl', '.mid', '.midi'].some(ext => lower.endsWith(ext))) {
+      e.target.value = ''
+      window.alert('Unsupported file type. Choose a .xml, .musicxml, .mxl, .mid or .midi file.')
+      return
+    }
     setFilename(file.name); handleStop()
     const reader = new FileReader()
     reader.onload = (evt) => setMusicXml(evt.target.result)
-    if (file.name.endsWith('.mid') || file.name.endsWith('.midi') || file.name.endsWith('.mxl')) {
+    if (lower.endsWith('.mid') || lower.endsWith('.midi') || lower.endsWith('.mxl')) {
       reader.readAsArrayBuffer(file)
     } else {
       reader.readAsText(file)
@@ -856,8 +892,8 @@ export default function Visualizer() {
           </div>
 
           <div className="flex items-center gap-2">
-            {/* Practice / Watch toggle */}
-            {timeline.length > 0 && (
+            {/* Practice / Watch toggle (Practice is MIDI-only; hidden on mobile) */}
+            {timeline.length > 0 && !isMobile && (
               <button
                 onClick={handlePracticeToggle}
                 className="hidden sm:flex items-center gap-1.5 px-3 h-9 rounded-lg text-xs font-bold transition-all cursor-pointer"
@@ -980,16 +1016,22 @@ export default function Visualizer() {
                 />
               </div>
               <div>
-                <label className="text-[10px] uppercase tracking-wider font-medium mb-1.5 block" style={{color:'var(--sub)'}}>Right Hand</label>
-                <input type="color" value={rightColor} onChange={(e) => setRightColor(e.target.value)}
-                  className="w-full h-8 rounded bg-transparent cursor-pointer" style={{border:'1px solid var(--border)'}}
-                />
+                <label className="text-[10px] uppercase tracking-wider font-medium mb-1.5 block" style={{color:'var(--sub)'}}>Left Hand</label>
+                {isMobile
+                  ? <ColorSwatches value={leftColor} onChange={setLeftColor} />
+                  : <input type="color" value={leftColor} onChange={(e) => setLeftColor(e.target.value)}
+                      className="w-full h-8 rounded bg-transparent cursor-pointer" style={{border:'1px solid var(--border)'}}
+                    />
+                }
               </div>
               <div>
-                <label className="text-[10px] uppercase tracking-wider font-medium mb-1.5 block" style={{color:'var(--sub)'}}>Left Hand</label>
-                <input type="color" value={leftColor} onChange={(e) => setLeftColor(e.target.value)}
-                  className="w-full h-8 rounded bg-transparent cursor-pointer" style={{border:'1px solid var(--border)'}}
-                />
+                <label className="text-[10px] uppercase tracking-wider font-medium mb-1.5 block" style={{color:'var(--sub)'}}>Right Hand</label>
+                {isMobile
+                  ? <ColorSwatches value={rightColor} onChange={setRightColor} />
+                  : <input type="color" value={rightColor} onChange={(e) => setRightColor(e.target.value)}
+                      className="w-full h-8 rounded bg-transparent cursor-pointer" style={{border:'1px solid var(--border)'}}
+                    />
+                }
               </div>
               <div className="flex flex-col gap-2">
                 <button onClick={() => setShowNoteNames(v => !v)}
@@ -1069,7 +1111,7 @@ export default function Visualizer() {
               </div>
             )}
             {/* Mobile practice toggle overlay */}
-            {timeline.length > 0 && (
+            {timeline.length > 0 && !isMobile && (
               <button
                 onClick={handlePracticeToggle}
                 className="sm:hidden absolute top-3 right-3 flex items-center gap-1.5 px-3 h-8 rounded-lg text-xs font-bold transition-all cursor-pointer"
@@ -1085,7 +1127,7 @@ export default function Visualizer() {
       </main>
 
       {/* Hidden file input */}
-      <input ref={fileInputRef} type="file" accept=".xml,.musicxml,.mxl,.mid,.midi" onChange={handleFileChange} className="hidden" />
+      <input ref={fileInputRef} type="file" accept={isMobile ? undefined : '.xml,.musicxml,.mxl,.mid,.midi'} onChange={handleFileChange} className="hidden" />
 
       {/* Demo picker modal */}
       {showDemoModal && (

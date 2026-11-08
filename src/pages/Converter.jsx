@@ -3,7 +3,8 @@ import { parseMidi } from 'midi-file'
 import { unzipSync } from 'fflate'
 import Background from '../Background'
 import { writeTextFile } from '@tauri-apps/plugin-fs'
-import { getSavedFolder } from '../lib/scoreFolder'
+import { getSavedFolder, saveXmlToScores, VALID_EXTS } from '../lib/scoreFolder'
+import { isMobile } from '../lib/platform'
 
 // ── XML helper ────────────────────────────────────────────────────────────────
 function escapeXml(s) {
@@ -196,6 +197,12 @@ async function convertFile(file) {
 
 // ── Save helper ───────────────────────────────────────────────────────────────
 async function saveXml(xml, filename) {
+  // On mobile the anchor-download fallback does nothing in a WebView, and the
+  // app-private scores library is where saved files belong anyway.
+  if (isMobile) {
+    await saveXmlToScores(filename, xml)
+    return { savedTo: 'My Scores' }
+  }
   const folder = getSavedFolder()
   if (folder) {
     const sep = folder.endsWith('/') || folder.endsWith('\\') ? '' : '/'
@@ -291,11 +298,19 @@ export default function Converter() {
   }
 
   const processFiles = useCallback(async (fileList) => {
-    const newItems = Array.from(fileList).map(file => ({
-      id: ++idCounter.current, file, status: 'converting', xml: null, error: null,
+    const files = Array.from(fileList)
+    // The mobile file input has no accept filter: unsupported files go
+    // straight into the queue as errors instead of being rejected silently.
+    const isAccepted = isMobile
+      ? (file) => VALID_EXTS.some(ext => file.name.toLowerCase().endsWith(ext)) || file.name.toLowerCase().endsWith('.pdf')
+      : () => true
+    const newItems = files.map(file => ({
+      id: ++idCounter.current, file,
+      status: isAccepted(file) ? 'converting' : 'error', xml: null,
+      error: isAccepted(file) ? null : 'Unsupported file type. Accepted: .xml, .musicxml, .mxl, .mid, .midi, .pdf',
     }))
     setItems(prev => [...prev, ...newItems])
-    await Promise.all(newItems.map(async item => {
+    await Promise.all(newItems.filter(i => i.status === 'converting').map(async item => {
       try {
         const xml = await convertFile(item.file)
         setItems(prev => prev.map(i => i.id === item.id ? { ...i, status: 'done', xml } : i))
@@ -420,7 +435,7 @@ export default function Converter() {
               </span>
             </div>
 
-            <input ref={inputRef} type="file" accept=".xml,.musicxml,.mxl,.mid,.midi,.pdf"
+            <input ref={inputRef} type="file" accept={isMobile ? undefined : '.xml,.musicxml,.mxl,.mid,.midi,.pdf'}
               multiple style={{ display:'none' }} onChange={handleInput} />
           </div>
         </div>

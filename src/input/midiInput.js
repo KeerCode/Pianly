@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { isMobile } from '../lib/platform'
 
 const DEBUG = import.meta.env.DEV
 
@@ -20,6 +21,8 @@ export function notesMatch(detected, target, anyOctave = false) {
 }
 
 export async function enableMidi() {
+  // MIDI input is not implemented on mobile (no backend in midir)
+  if (isMobile) return { supported: false, inputs: [] }
   DEBUG && console.log('[MIDI] Querying devices via Tauri...')
   try {
     const inputs = await invoke('get_midi_inputs')
@@ -40,6 +43,7 @@ let unlistenOff = null
 // never removed and every note arrived twice.
 let listenChain = Promise.resolve()
 export function listenToDevice(deviceId, onNote, onNoteOff) {
+  if (isMobile) return Promise.resolve(null)
   const run = listenChain.then(() => connectDevice(deviceId, onNote, onNoteOff))
   listenChain = run.catch(() => {})
   return run
@@ -82,6 +86,7 @@ async function connectDevice(deviceId, onNote, onNoteOff) {
 let pollInterval = null
 
 export function onDevicesChanged(callback) {
+  if (isMobile) return () => {}
   let lastJson = '[]'
 
   pollInterval = setInterval(async () => {

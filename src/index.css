@@ -12,6 +12,15 @@
 
 body { font-family: 'Sora', sans-serif; }
 
+/* Touch-friendly globals; harmless on desktop */
+html { overscroll-behavior: none; }
+body {
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  user-select: none;
+}
+input, textarea, [contenteditable] { user-select: text; }
+
 /* Verovio current note highlight */
 .current-note * {
   fill: oklch(0.55 0.18 160) !important;
@@ -29,8 +38,9 @@ body { font-family: 'Sora', sans-serif; }
 .glass {
   background: rgba(255,255,255,0.025);
   border: 1px solid var(--border);
-  backdrop-filter: blur(12px);
+  /* Prefixed first: the minifier keeps only the last of the two */
   -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
 }
 
 /* Converter page animations */

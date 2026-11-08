@@ -7,6 +7,7 @@ import { SplendidGrandPiano } from 'smplr'
 import { DEMO_PIECES, loadDemoScore } from '../data/demoScores'
 import { noteNameToMidi, getInterval } from '../utils/noteConversion'
 import { getSavedFolder, pickFolder } from '../lib/scoreFolder'
+import { isMobile } from '../lib/platform'
 import { enableMidi, listenToDevice, notesMatch, onDevicesChanged } from '../input/midiInput'
 import { startBasicPitchDetection, loadBasicPitchModel, isBasicPitchReady } from '../input/pitchDetector'
 import { StepGate } from '../practice/stepGate'
@@ -116,7 +117,7 @@ function App() {
   const [midiDevices, setMidiDevices] = useState([])
   const [selectedDeviceId, setSelectedDeviceId] = useState(null)
   const [anyOctave, setAnyOctave] = useState(false)
-  const [inputMode, setInputMode] = useState(() => localStorage.getItem('nf-input') || 'midi')
+  const [inputMode, setInputMode] = useState(() => isMobile ? 'mic' : (localStorage.getItem('nf-input') || 'midi'))
   const [autoscroll, setAutoscroll] = useState(true)
   const [modelLoading, setModelLoading] = useState(false)
   const [modelReady, setModelReady] = useState(false)
@@ -140,6 +141,7 @@ function App() {
   const stopListenerRef = useRef(null)
   const stopMicRef = useRef(null)
   const wrongTimerRef = useRef(null)
+  const musicXmlRef = useRef(null)
 
   const currentNoteIndexRef = useRef(0)
   const noteTimelineRef = useRef([])
@@ -161,6 +163,7 @@ function App() {
   const autoscrollRef = useRef(true)
   const playbackSpeedRef = useRef(1.0)
 
+  useEffect(() => { musicXmlRef.current = musicXml }, [musicXml])
   useEffect(() => { currentNoteIndexRef.current = currentNoteIndex }, [currentNoteIndex])
   useEffect(() => { noteTimelineRef.current = noteTimeline }, [noteTimeline])
   useEffect(() => { completedRef.current = completed }, [completed])
@@ -264,7 +267,8 @@ function App() {
         const status = await navigator.permissions.query({ name: 'microphone' })
         setMicPermission(status.state)
         // Only prompt if the browser explicitly says the user hasn't decided yet
-        if (status.state === 'prompt') setShowMicPrompt(true)
+        // The Android WebView always reports 'prompt'; Android asks on first use instead
+        if (status.state === 'prompt' && !isMobile) setShowMicPrompt(true)
         status.addEventListener('change', () => {
           setMicPermission(status.state)
           if (status.state === 'granted') setShowMicPrompt(false)
@@ -277,8 +281,13 @@ function App() {
     checkMicPermission()
   }, [inputMode])
 
-  // Probe MIDI on mount
+  // Probe MIDI on mount (skipped on mobile: microphone is the only input)
   useEffect(() => {
+    if (isMobile) {
+      setMidiSupported(false)
+      setInputMode('mic')
+      return
+    }
     enableMidi().then(({ supported, inputs }) => {
       setMidiSupported(supported)
       setMidiDevices(inputs)
@@ -644,6 +653,22 @@ function App() {
     setDetectedNote(heldNotesRef.current.size ? [...heldNotesRef.current].join(' + ') : null)
   }, [])
 
+  // Start Basic Pitch on the microphone. Shared by practice start and by
+  // resume, which reopens the mic after it was released on backgrounding.
+  const startMicDetection = useCallback(async () => {
+    const onNotes = (notes) => {
+      const heard = new Set(notes ?? [])
+      heldNotesRef.current = heard
+      setDetectedNote(heard.size ? [...heard].join(' + ') : null)
+      // A note that is still ringing is not played again; one that has just
+      // appeared is a new press.
+      for (const n of heard) if (!micHeardRef.current.has(n)) handlePress(n)
+      micHeardRef.current = heard
+    }
+    const stop = await startBasicPitchDetection(onNotes)
+    stopMicRef.current = stop
+  }, [handlePress])
+
   // The cursor moved on: notes of this step that were played early may already
   // complete it, in which case its wait starts from when they were played.
   useEffect(() => {
@@ -691,6 +716,38 @@ function App() {
     }
   }, [])
 
+  // Release the microphone and pause practice/listen when the app goes to the
+  // background, so it does not keep recording or playing with the screen off.
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState !== 'hidden') return
+      if (stopMicRef.current) { stopMicRef.current(); stopMicRef.current = null }
+      if (modeRef.current === 'practice' && !pausedRef.current && !completedRef.current) {
+        handlePausePractice()
+      } else if (modeRef.current === 'listen' && !pausedRef.current) {
+        handleListenPause()
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => document.removeEventListener('visibilitychange', onVisibility)
+  }, [])
+
+  // Android back: the practice screen is state, not a route. While a score is
+  // open we push a history entry so the system back button lands on home.
+  useEffect(() => {
+    if (!isMobile || musicXml == null) return
+    window.history.pushState({ pianlyPractice: true }, '')
+  }, [musicXml])
+
+  useEffect(() => {
+    if (!isMobile) return
+    const onPop = () => {
+      if (musicXmlRef.current != null) handleBack()
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [])
+
   function stopToneListenLoop() {
     if (toneListenRafRef.current) {
       cancelAnimationFrame(toneListenRafRef.current)
@@ -726,10 +783,17 @@ function App() {
   function handleFileChange(e) {
     const file = e.target.files?.[0]
     if (!file) return
+    const lower = file.name.toLowerCase()
+    // The mobile file input has no accept filter, so validate by extension.
+    if (isMobile && !['.xml', '.musicxml', '.mxl'].some(ext => lower.endsWith(ext))) {
+      e.target.value = ''
+      window.alert('Unsupported file type. Choose a .xml, .musicxml or .mxl file.')
+      return
+    }
     setFilename(file.name)
     const reader = new FileReader()
     reader.onload = (evt) => setMusicXml(evt.target.result)
-    if (file.name.endsWith('.mxl')) {
+    if (lower.endsWith('.mxl')) {
       reader.readAsArrayBuffer(file)
     } else {
       reader.readAsText(file)
@@ -752,6 +816,12 @@ function App() {
   }
 
   function handleBack() {
+    // The on-screen back button consumes the history entry pushed for the
+    // practice screen; the popstate handler then runs this cleanup once.
+    if (isMobile && window.history.state?.pianlyPractice) {
+      window.history.back()
+      return
+    }
     stopAllInputs()
     setMusicXml(null)
     setFilename('')
@@ -968,7 +1038,7 @@ function App() {
     lastTickSetRef.current = -1
     resetStepState()
 
-    if (inputMode === 'midi') {
+    if (inputMode === 'midi' && !isMobile) {
       if (!selectedDeviceId) {
         setInputError(
           midiSupported === false
@@ -995,17 +1065,7 @@ function App() {
       }
     } else {
       try {
-        const onNotes = (notes) => {
-          const heard = new Set(notes ?? [])
-          heldNotesRef.current = heard
-          setDetectedNote(heard.size ? [...heard].join(' + ') : null)
-          // A note that is still ringing is not played again; one that has just
-          // appeared is a new press.
-          for (const n of heard) if (!micHeardRef.current.has(n)) handlePress(n)
-          micHeardRef.current = heard
-        }
-        const stop = await startBasicPitchDetection(onNotes)
-        stopMicRef.current = stop
+        await startMicDetection()
       } catch (err) {
         const denied = err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError'
         setInputError(
@@ -1043,6 +1103,12 @@ function App() {
     const w = stepWaitRef.current
     if (w && !w.timer) scheduleStepWait(w.idx, performance.now() + w.remaining)
     setPaused(false)
+    // Reopen the mic if it was released while the app was backgrounded.
+    if (inputMode === 'mic' && !stopMicRef.current) {
+      startMicDetection().catch((err) => {
+        setInputError(`Could not start mic: ${err?.message || 'unknown error'}`)
+      })
+    }
   }
 
   function handleRestart() {
@@ -1177,7 +1243,7 @@ function App() {
                   onMouseEnter={e=>{e.currentTarget.style.background='rgba(0,255,200,0.08)';e.currentTarget.style.transform='translateY(-2px) scale(1.02)'}}
                   onMouseLeave={e=>{e.currentTarget.style.background='transparent';e.currentTarget.style.transform='translateY(0) scale(1)'}}>
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
-                  {folderPath.split('/').filter(Boolean).pop()}
+                  {isMobile ? 'My Scores' : folderPath.split('/').filter(Boolean).pop()}
                 </button>
               )}
             </div>
@@ -1202,7 +1268,7 @@ function App() {
       <input
         ref={fileInputRef}
         type="file"
-        accept=".xml,.musicxml,.mxl"
+        accept={isMobile ? undefined : '.xml,.musicxml,.mxl'}
         onChange={handleFileChange}
         className="hidden"
       />
@@ -1239,7 +1305,7 @@ function App() {
                 <p className="text-[10px] uppercase tracking-widest mb-3" style={{color:'var(--sub)'}}>Input Method</p>
                 <div className="grid grid-cols-2 gap-3">
                   {[
-                    { id: 'midi', label: 'MIDI Keyboard', icon: (
+                    { id: 'midi', label: 'MIDI Keyboard', mobileHidden: true, icon: (
                       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
                         <rect x="2" y="7" width="20" height="14" rx="2"/>
                         <path d="M7 7V5a1 1 0 011-1h8a1 1 0 011 1v2"/>
@@ -1255,7 +1321,7 @@ function App() {
                         <line x1="9" y1="21" x2="15" y2="21"/>
                       </svg>
                     )},
-                  ].map(({ id, label, icon }) => {
+                  ].filter(m => !isMobile || !m.mobileHidden).map(({ id, label, icon }) => {
                     const active = inputMode === id
                     return (
                       <button
@@ -1308,9 +1374,9 @@ function App() {
             PRACTICE / LISTEN SCREEN (musicXml loaded)
         ════════════════════════════════════════════════════════ */}
         {musicXml && (
-          <div className="relative z-10 flex flex-col items-center px-4 sm:px-6 pt-4 sm:pt-6 pb-4 h-full overflow-y-auto">
+          <div className="relative z-10 flex flex-col items-center px-4 sm:px-6 pt-4 sm:pt-6 pb-4 h-full overflow-y-auto [@media(max-height:500px)]:pt-2">
             {/* Thin top bar */}
-            <div className="w-full max-w-4xl flex items-center justify-between mb-6 pb-4" style={{borderBottom:'1px solid var(--border)'}}>
+            <div className="w-full max-w-4xl flex items-center justify-between mb-6 pb-4 [@media(max-height:500px)]:mb-2 [@media(max-height:500px)]:pb-2" style={{borderBottom:'1px solid var(--border)'}}>
               {/* Left: back + filename */}
               <div className="flex items-center gap-3 min-w-0">
                 <button
@@ -1416,7 +1482,7 @@ function App() {
             )}
 
             {/* Input status */}
-            <div className="w-full max-w-4xl mb-4 flex items-center gap-2 text-xs" style={{color:'var(--sub)'}}>
+            <div className="w-full max-w-4xl mb-4 [@media(max-height:500px)]:mb-1.5 flex items-center gap-2 text-xs" style={{color:'var(--sub)'}}>
               {inputMode === 'mic' ? (
                 <>
                   <span className={`inline-block w-1.5 h-1.5 rounded-full ${modelLoading ? 'animate-pulse' : ''}`} style={{background:'var(--accent)'}} />
@@ -1427,7 +1493,7 @@ function App() {
                   <span className="inline-block w-1.5 h-1.5 rounded-full" style={{background:'var(--accent)'}} />
                   <span>MIDI: {selectedDevice.name}</span>
                 </>
-              ) : midiSupported === false ? (
+              ) : midiSupported === false && !isMobile ? (
                 <>
                   <span className="inline-block w-1.5 h-1.5 rounded-full bg-red-400" />
                   <span>MIDI requires Chrome or Edge — switch to Microphone in settings</span>
@@ -1552,9 +1618,9 @@ function App() {
         {/* Demo picker modal */}
         {/* ── Sheet Picker modal ──────────────────────────────────────────── */}
         {showSheetPicker && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md px-4"
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md px-4 py-4"
             onClick={e => { if (e.target === e.currentTarget) setShowSheetPicker(false) }}>
-            <div className="rounded-2xl w-full max-w-lg p-5 sm:p-6 shadow-2xl" style={{background:'var(--panel)',border:'1px solid var(--border)'}}>
+            <div className="rounded-2xl w-full max-w-lg max-h-[92vh] overflow-y-auto p-5 sm:p-6 shadow-2xl" style={{background:'var(--panel)',border:'1px solid var(--border)'}}>
               <div className="flex items-center justify-between mb-5">
                 <h2 className="text-lg sm:text-xl font-bold" style={{color:'var(--ink)'}}>Sheet Practice</h2>
                 <button onClick={() => setShowSheetPicker(false)} className="transition-colors cursor-pointer" style={{color:'var(--sub)'}}
@@ -1607,7 +1673,7 @@ function App() {
             className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md px-4"
             onClick={(e) => { if (e.target === e.currentTarget) setShowDemoModal(false) }}
           >
-            <div className="rounded-2xl w-full max-w-lg p-5 sm:p-6 shadow-2xl" style={{background:'var(--panel)',border:'1px solid var(--border)'}}>
+            <div className="rounded-2xl w-full max-w-lg max-h-[92vh] overflow-y-auto p-5 sm:p-6 shadow-2xl" style={{background:'var(--panel)',border:'1px solid var(--border)'}}>
               <div className="flex items-center justify-between mb-5 sm:mb-6">
                 <h2 className="text-lg sm:text-xl font-bold" style={{color:'var(--ink)'}}>Choose a Demo Piece</h2>
                 <button onClick={() => setShowDemoModal(false)} className="transition-colors cursor-pointer" style={{color:'var(--sub)'}} aria-label="Close"
@@ -1641,7 +1707,7 @@ function App() {
             className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md px-4"
             onClick={(e) => { if (e.target === e.currentTarget) setShowSettings(false) }}
           >
-            <div className="rounded-2xl w-full max-w-sm p-5 sm:p-6 shadow-2xl" style={{background:'var(--panel)',border:'1px solid var(--border)'}}>
+            <div className="rounded-2xl w-full max-w-sm max-h-[92vh] overflow-y-auto p-5 sm:p-6 shadow-2xl" style={{background:'var(--panel)',border:'1px solid var(--border)'}}>
               <div className="flex items-center justify-between mb-5">
                 <h2 className="text-lg font-bold" style={{color:'var(--ink)'}}>Settings</h2>
                 <button onClick={() => setShowSettings(false)} className="transition-colors cursor-pointer" style={{color:'var(--sub)'}} aria-label="Close"
@@ -1654,10 +1720,12 @@ function App() {
               <div className="mb-5">
                 <label className="text-xs uppercase tracking-wider font-medium mb-2 block" style={{color:'var(--sub)'}}>Input Source</label>
                 <div className="flex rounded-lg overflow-hidden text-sm font-medium" style={{border:'1px solid var(--border)'}}>
+                  {!isMobile && (
                   <button onClick={() => setInputMode('midi')} disabled={midiSupported === false} className="flex-1 px-3 py-2 flex items-center justify-center gap-2 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed" style={inputMode === 'midi' ? {background:'rgba(0,255,200,0.1)',color:'var(--ink)'} : {color:'var(--sub)'}}>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="6" width="20" height="14" rx="2"/><path d="M8 6v8M12 6v8M16 6v8"/></svg>
                     MIDI
                   </button>
+                  )}
                   <button onClick={() => setInputMode('mic')} className="flex-1 px-3 py-2 flex items-center justify-center gap-2 transition-colors cursor-pointer" style={inputMode === 'mic' ? {background:'rgba(0,255,200,0.1)',color:'var(--ink)'} : {color:'var(--sub)'}}>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg>
                     Microphone
