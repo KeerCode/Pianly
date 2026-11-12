@@ -146,8 +146,17 @@ function generateTarget(difficulty) {
 
 // ─── MusicXML Generation ──────────────────────────────────────────────────────
 
+function accidentalName(alter) {
+  if (alter === 1) return 'sharp'
+  if (alter === -1) return 'flat'
+  if (alter === 2) return 'double-sharp'
+  if (alter === -2) return 'flat-flat'
+  return null
+}
+
 function noteXml(midi, isChord, staff, voice) {
   const { step, alter, octave } = midiToXmlParts(midi)
+  const accidental = accidentalName(alter)
   return [
     '      <note>',
     isChord      ? '        <chord/>'                  : null,
@@ -158,6 +167,8 @@ function noteXml(midi, isChord, staff, voice) {
     '        </pitch>',
     '        <duration>4</duration>',
     '        <type>whole</type>',
+    // Verovio engraves visual accidentals from <accidental>, not from <alter> alone.
+    accidental   ? `        <accidental>${accidental}</accidental>` : null,
     `        <staff>${staff}</staff>`,
     `        <voice>${voice}</voice>`,
     '      </note>',
